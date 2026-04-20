@@ -31,7 +31,14 @@ locally — no browser tab, no copy-paste, no cloud sync.
 
 ## Getting started
 
-### 1. Install the prerequisites
+### Method 1 - Download
+
+- Download — one direct link to (Download)[https://github.com/janithcooray/claude-desktop/releases/download/v0.1.0-alpha/Claude-Desktop-0.1.0.AppImage]
+- First launch — app handles CLI install + sign-in for you
+- Sandbox mode — Settings → Security
+
+### Method 2 - Build
+#### 1. Install the prerequisites
 
 - **Node.js 20 or newer** — <https://nodejs.org>
 - **Build tools** for the native SQLite module:
@@ -47,7 +54,7 @@ locally — no browser tab, no copy-paste, no cloud sync.
 You do **not** need to install the `claude` CLI ahead of time — the app
 will offer to install it for you on first launch.
 
-### 2. Install the app
+#### 2. Install the app
 
 ```bash
 git clone <this-repo> claude-desktop
@@ -59,7 +66,7 @@ npm install
 If it fails, re-run it with `--foreground-scripts` to see the native build
 log.
 
-### 3. Run it
+#### 3. Run it
 
 **Dev mode** (hot-reload, devtools open):
 
@@ -76,7 +83,7 @@ npm run pack
 # Windows: ./release/Cowork Setup *.exe
 ```
 
-### 4. First launch
+### First launch
 
 1. **Install the CLI.** If `claude` isn't on your system, a modal pops up
    offering to install it. It runs the official one-liner
