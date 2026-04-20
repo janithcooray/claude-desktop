@@ -27,9 +27,8 @@ export default function Sidebar({
 }) {
   // The tab is purely a user-controlled view filter. It no longer follows the
   // active chat — if the user parks on "Chats" we don't want opening a cowork
-  // chat (e.g. from resumed CLI history) to yank them over to the Cowork tab.
-  // Seed once from whatever chat happens to be active at mount, then leave it
-  // alone.
+  // chat to yank them over to the Cowork tab. Seed once from whatever chat
+  // happens to be active at mount, then leave it alone.
   const activeChat = useMemo(
     () => chats.find((c) => c.id === activeChatId) || null,
     [chats, activeChatId]

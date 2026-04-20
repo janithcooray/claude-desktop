@@ -230,10 +230,9 @@ export default function App() {
   // mode is 'chat' (pure conversation, no tools) or 'cowork' (agentic).
   // No folder dialog at creation — folders are optional and added explicitly
   // from the chat itself, just like a fresh Claude conversation.
-  // `seed` lets callers prefill fields (e.g. resuming from CLI history sets
-  // claudeSessionId + a title). When `seed.model` isn't provided we seed the
-  // new chat with the user's app-wide default model from prefs so the
-  // composer's picker reflects the right choice from the start.
+  // `seed` lets callers prefill fields. When `seed.model` isn't provided we
+  // seed the new chat with the user's app-wide default model from prefs so
+  // the composer's picker reflects the right choice from the start.
   const handleNewChat = useCallback(async (mode = 'cowork', seed = {}) => {
     const normMode = mode === 'chat' ? 'chat' : 'cowork';
     let seededModel = seed.model ?? null;

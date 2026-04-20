@@ -351,111 +351,6 @@ async function getUsageBlob(name, { sandboxRoot }) {
   };
 }
 
-// Scan ~/.claude/projects/*/<session-id>.jsonl for past CLI sessions so the
-// Chats tab can show the user's recent claude conversations. We read only the
-// head of each JSONL file for a title, and stat for the timestamp. Failures
-// are swallowed so a malformed file never breaks the listing.
-//
-// Each --resume turn writes a fresh jsonl file for the same conversation,
-// so a chat with N turns produces N sibling files under the same project dir.
-// We collapse those here: within a project, files whose preview yields the
-// same first user message are treated as one chain, and only the newest
-// (mtime) entry is shown. Files with no user message in the head window
-// (pure continuations whose first line is a summary/init) are dropped —
-// they'd render as an "empty" duplicate right next to the real chat.
-function listClaudeHistory(limit) {
-  const home = process.env.HOME || '';
-  if (!home) return [];
-  const root = path.join(home, '.claude', 'projects');
-  let projects;
-  try { projects = fs.readdirSync(root); } catch { return []; }
-
-  const out = [];
-  for (const proj of projects) {
-    const projDir = path.join(root, proj);
-    let files;
-    try { files = fs.readdirSync(projDir); } catch { continue; }
-    // Collapse continuation chains: key by (projectPath, firstUserMessage),
-    // keep only the most recent jsonl per key.
-    const byChain = new Map();
-    for (const f of files) {
-      if (!f.endsWith('.jsonl')) continue;
-      const full = path.join(projDir, f);
-      let st;
-      try { st = fs.statSync(full); } catch { continue; }
-      if (!st.isFile()) continue;
-      const id = f.replace(/\.jsonl$/, '');
-      const projectPath = '/' + proj.replace(/^-/, '').split('-').join('/');
-      const preview = readHistoryPreview(full);
-      // Drop entries with no identifiable user message — these are almost
-      // always mid-chain continuation files and would render as a confusing
-      // "(no messages)" duplicate of the real chat above them.
-      if (!preview.firstUserMessage) continue;
-      const entry = {
-        id,
-        file: full,
-        project: proj,
-        projectPath,
-        updatedAt: st.mtimeMs,
-        title: preview.title,
-        firstUserMessage: preview.firstUserMessage,
-        messageCount: preview.messageCount,
-      };
-      const chainKey = `${projectPath}::${preview.firstUserMessage}`;
-      const existing = byChain.get(chainKey);
-      if (!existing || existing.updatedAt < entry.updatedAt) {
-        byChain.set(chainKey, entry);
-      }
-    }
-    for (const entry of byChain.values()) out.push(entry);
-  }
-  out.sort((a, b) => b.updatedAt - a.updatedAt);
-  return out.slice(0, limit);
-}
-
-// Parse a small slice of a JSONL session file to derive a readable title and
-// the first user message. The CLI writes one JSON object per line; layout
-// varies across versions so we handle a few shapes.
-function readHistoryPreview(file) {
-  let firstUserMessage = '';
-  let messageCount = 0;
-  try {
-    // Read up to ~128KB — enough for the first user turn in every session
-    // shape I've seen without blowing memory on giant transcripts.
-    const fd = fs.openSync(file, 'r');
-    try {
-      const max = 128 * 1024;
-      const buf = Buffer.alloc(max);
-      const n = fs.readSync(fd, buf, 0, max, 0);
-      const head = buf.slice(0, n).toString('utf8');
-      for (const line of head.split('\n')) {
-        if (!line.trim()) continue;
-        let obj;
-        try { obj = JSON.parse(line); } catch { continue; }
-        messageCount += 1;
-        if (firstUserMessage) continue;
-        // Common shapes:
-        //   { type: 'user', message: { role:'user', content: 'hi' | [...] } }
-        //   { role: 'user', content: 'hi' }
-        const role = obj?.message?.role || obj?.role || obj?.type;
-        if (role !== 'user') continue;
-        const content = obj?.message?.content ?? obj?.content;
-        const txt = toolResultText(content);
-        if (typeof txt === 'string' && txt.trim()) {
-          firstUserMessage = txt.trim();
-        }
-      }
-    } finally {
-      fs.closeSync(fd);
-    }
-  } catch { /* ignore */ }
-
-  const title = firstUserMessage
-    ? firstUserMessage.slice(0, 80).replace(/\s+/g, ' ')
-    : '(no messages)';
-  return { title, firstUserMessage, messageCount };
-}
-
 async function getClaudeInfo() {
   const bin = resolveClaudeBin();
   let binExists = false;
@@ -1154,11 +1049,6 @@ async function route(req, res, { sandboxRoot }) {
 
   if (req.method === 'GET' && p === '/info') {
     return json(res, 200, await getClaudeInfo());
-  }
-
-  if (req.method === 'GET' && p === '/claude-history') {
-    const limit = Number(url.searchParams.get('limit') || 100);
-    return json(res, 200, { sessions: listClaudeHistory(Math.max(1, Math.min(500, limit))) });
   }
 
   // Account info — `claude auth status` (JSON). Exit 0 = signed in.
