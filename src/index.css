@@ -1,0 +1,59 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+:root {
+  color-scheme: dark;
+}
+
+html, body, #root {
+  height: 100%;
+  margin: 0;
+}
+
+body {
+  overflow: hidden;
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+}
+
+/* Scrollbar: slim and unobtrusive */
+*::-webkit-scrollbar { width: 10px; height: 10px; }
+*::-webkit-scrollbar-track { background: transparent; }
+*::-webkit-scrollbar-thumb {
+  background: rgba(255,255,255,0.08);
+  border-radius: 8px;
+  border: 2px solid transparent;
+  background-clip: padding-box;
+}
+*::-webkit-scrollbar-thumb:hover { background: rgba(255,255,255,0.16); background-clip: padding-box; border: 2px solid transparent; }
+
+/* Markdown-ish prose used inside assistant bubbles */
+.prose-msg p { margin: 0.35rem 0; }
+.prose-msg pre {
+  background: rgba(0,0,0,0.35);
+  padding: 0.75rem;
+  border-radius: 8px;
+  overflow-x: auto;
+  font-size: 12.5px;
+  line-height: 1.5;
+  margin: 0.5rem 0;
+}
+.prose-msg code {
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 0.875em;
+}
+.prose-msg p > code {
+  background: rgba(255,255,255,0.08);
+  padding: 1px 4px;
+  border-radius: 4px;
+}
+
+/* Blinking cursor for streaming assistant text */
+.cursor-blink::after {
+  content: '▌';
+  margin-left: 2px;
+  opacity: 0.55;
+  animation: blink 1s steps(2, start) infinite;
+}
+@keyframes blink { to { visibility: hidden; } }

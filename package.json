@@ -1,0 +1,50 @@
+{
+  "name": "cowork-desktop",
+  "version": "0.1.0",
+  "description": "Claude Cowork-style desktop shell. Drives the headless `claude` CLI directly from the Electron main process.",
+  "main": "electron/main.cjs",
+  "private": true,
+  "scripts": {
+    "dev": "concurrently -k -n vite,electron -c \"cyan,magenta\" \"npm:dev:vite\" \"npm:dev:electron\"",
+    "dev:vite": "vite",
+    "dev:electron": "wait-on tcp:5173 && cross-env NODE_ENV=development electron .",
+    "build": "vite build",
+    "start": "cross-env NODE_ENV=production electron .",
+    "pack": "npm run build && electron-builder --linux AppImage --publish=never",
+    "postinstall": "electron-builder install-app-deps"
+  },
+  "dependencies": {
+    "better-sqlite3": "^11.3.0"
+  },
+  "devDependencies": {
+    "@vitejs/plugin-react": "^4.3.1",
+    "autoprefixer": "^10.4.20",
+    "concurrently": "^9.0.1",
+    "cross-env": "^7.0.3",
+    "electron": "^32.3.3",
+    "electron-builder": "^25.0.5",
+    "postcss": "^8.4.47",
+    "react": "^18.3.1",
+    "react-dom": "^18.3.1",
+    "tailwindcss": "^3.4.13",
+    "vite": "^5.4.8",
+    "wait-on": "^8.0.1"
+  },
+  "build": {
+    "appId": "com.cowork.desktop",
+    "productName": "Cowork",
+    "asar": true,
+    "files": [
+      "electron/**/*",
+      "dist/**/*",
+      "package.json"
+    ],
+    "linux": {
+      "target": [
+        "AppImage"
+      ],
+      "category": "Utility",
+      "artifactName": "${productName}-${version}.${ext}"
+    }
+  }
+}
