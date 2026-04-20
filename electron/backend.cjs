@@ -28,6 +28,8 @@ const fs = require('node:fs');
 const fsp = require('node:fs/promises');
 const { spawn } = require('node:child_process');
 
+const { detectSandbox, wrapWithSandbox } = require('./sandbox.cjs');
+
 const ALLOWED_TOOLS_DEFAULT = 'Read,Write,Edit,Bash,Glob,Grep';
 const PERMISSION_MODE_DEFAULT = 'acceptEdits';
 
@@ -353,6 +355,14 @@ async function getUsageBlob(name, { sandboxRoot }) {
 // Chats tab can show the user's recent claude conversations. We read only the
 // head of each JSONL file for a title, and stat for the timestamp. Failures
 // are swallowed so a malformed file never breaks the listing.
+//
+// Each --resume turn writes a fresh jsonl file for the same conversation,
+// so a chat with N turns produces N sibling files under the same project dir.
+// We collapse those here: within a project, files whose preview yields the
+// same first user message are treated as one chain, and only the newest
+// (mtime) entry is shown. Files with no user message in the head window
+// (pure continuations whose first line is a summary/init) are dropped —
+// they'd render as an "empty" duplicate right next to the real chat.
 function listClaudeHistory(limit) {
   const home = process.env.HOME || '';
   if (!home) return [];
@@ -365,6 +375,9 @@ function listClaudeHistory(limit) {
     const projDir = path.join(root, proj);
     let files;
     try { files = fs.readdirSync(projDir); } catch { continue; }
+    // Collapse continuation chains: key by (projectPath, firstUserMessage),
+    // keep only the most recent jsonl per key.
+    const byChain = new Map();
     for (const f of files) {
       if (!f.endsWith('.jsonl')) continue;
       const full = path.join(projDir, f);
@@ -372,11 +385,13 @@ function listClaudeHistory(limit) {
       try { st = fs.statSync(full); } catch { continue; }
       if (!st.isFile()) continue;
       const id = f.replace(/\.jsonl$/, '');
-      // ~/.claude/projects encodes the working directory in the folder name
-      // (slashes replaced with dashes) — decode best-effort for display.
       const projectPath = '/' + proj.replace(/^-/, '').split('-').join('/');
       const preview = readHistoryPreview(full);
-      out.push({
+      // Drop entries with no identifiable user message — these are almost
+      // always mid-chain continuation files and would render as a confusing
+      // "(no messages)" duplicate of the real chat above them.
+      if (!preview.firstUserMessage) continue;
+      const entry = {
         id,
         file: full,
         project: proj,
@@ -385,8 +400,14 @@ function listClaudeHistory(limit) {
         title: preview.title,
         firstUserMessage: preview.firstUserMessage,
         messageCount: preview.messageCount,
-      });
+      };
+      const chainKey = `${projectPath}::${preview.firstUserMessage}`;
+      const existing = byChain.get(chainKey);
+      if (!existing || existing.updatedAt < entry.updatedAt) {
+        byChain.set(chainKey, entry);
+      }
     }
+    for (const entry of byChain.values()) out.push(entry);
   }
   out.sort((a, b) => b.updatedAt - a.updatedAt);
   return out.slice(0, limit);
@@ -543,6 +564,8 @@ function streamInstallClaude(res) {
 //
 // `opts.hint` is an optional one-line banner printed above the CLI invocation
 // (used by the Claude Code settings button to nudge the user to type /config).
+// `opts.args` is an optional argv to pass to the CLI (e.g. `['auth','login']`
+// to skip the general TUI onboarding and go straight to the OAuth flow).
 function openClaudeTerminal(res, opts = {}) {
   const bin = resolveClaudeBin();
   const platform = process.platform;
@@ -552,7 +575,10 @@ function openClaudeTerminal(res, opts = {}) {
   const hint = opts.hint
     ? `echo; echo '${String(opts.hint).replace(/'/g, "'\\''")}'; echo;`
     : '';
-  const cmd = `${hint}${shellQuote(bin)} || true; echo; echo '[press return to close]'; read _`;
+  const argv = Array.isArray(opts.args) && opts.args.length
+    ? ' ' + opts.args.map(shellQuote).join(' ')
+    : '';
+  const cmd = `${hint}${shellQuote(bin)}${argv} || true; echo; echo '[press return to close]'; read _`;
 
   let child;
   let detail = '';
@@ -573,16 +599,22 @@ function openClaudeTerminal(res, opts = {}) {
       });
       detail = 'Command Prompt';
     } else {
-      // Linux: try common terminal emulators in order. First one that launches
-      // wins. This is a best-effort; headless systems will get a clear error.
+      // Linux: try common terminal emulators in order. First one present on
+      // $PATH wins. `spawn` doesn't throw synchronously when the binary is
+      // missing — it emits an async `error` event — so we must probe $PATH
+      // ourselves instead of relying on try/catch around `spawn`.
       const attempts = [
         ['x-terminal-emulator', ['-e', 'bash', '-lc', cmd]],
         ['gnome-terminal', ['--', 'bash', '-lc', cmd]],
         ['konsole', ['-e', 'bash', '-lc', cmd]],
+        ['alacritty', ['-e', 'bash', '-lc', cmd]],
+        ['kitty', ['bash', '-lc', cmd]],
+        ['xfce4-terminal', ['-e', `bash -lc ${shellQuote(cmd)}`]],
         ['xterm', ['-e', 'bash', '-lc', cmd]],
       ];
       let launched = false;
       for (const [prog, args] of attempts) {
+        if (!onPath(prog)) continue;
         try {
           child = spawn(prog, args, { stdio: 'ignore', detached: true });
           detail = prog;
@@ -609,6 +641,27 @@ function openClaudeTerminal(res, opts = {}) {
 function shellQuote(s) {
   if (!s) return '""';
   return `"${String(s).replace(/(["\\$`])/g, '\\$1')}"`;
+}
+
+// Return true if `prog` resolves to an executable on $PATH. Used to probe for
+// terminal emulators without relying on spawn's async ENOENT behaviour.
+function onPath(prog) {
+  const p = process.env.PATH || '';
+  const sep = process.platform === 'win32' ? ';' : ':';
+  const exts = process.platform === 'win32'
+    ? (process.env.PATHEXT || '.EXE;.CMD;.BAT').split(';')
+    : [''];
+  for (const dir of p.split(sep)) {
+    if (!dir) continue;
+    for (const ext of exts) {
+      const full = path.join(dir, prog + ext);
+      try {
+        fs.accessSync(full, fs.constants.X_OK);
+        return true;
+      } catch { /* keep searching */ }
+    }
+  }
+  return false;
 }
 
 function startClaude({ prompt, cwd, resumeId, mode, model, addDirs, permissionMode, allowedTools, disallowedTools, shellMode, dockerImage }) {
@@ -712,6 +765,39 @@ function startClaude({ prompt, cwd, resumeId, mode, model, addDirs, permissionMo
     });
   }
 
+  if (sm === 'jailbroken') {
+    // Explicit opt-out: spawn directly on the host with whatever permissions
+    // the user has granted. The jailbroken tool-policy defaults above already
+    // widened allowedTools and permissionMode.
+    process.stderr.write(`[claude] jailbroken host spawn\n`);
+    return spawn(bin, claudeArgs, {
+      cwd,
+      env,
+      stdio: ['ignore', 'pipe', 'pipe'],
+    });
+  }
+
+  // Default mode: wrap in bubblewrap so the CLI can't reach outside the
+  // user-attached folders. wrapWithSandbox returns null on non-Linux (no
+  // sandbox implementation → fall back to host spawn as before) and throws
+  // SANDBOX_UNAVAILABLE on Linux without bwrap (caller surfaces as SSE error).
+  const wrapped = wrapWithSandbox(bin, claudeArgs, {
+    cwd,
+    addDirs: addDirs || [],
+  });
+  if (wrapped) {
+    process.stderr.write(`[claude] sandbox bwrap cwd=${cwd} addDirs=${(addDirs || []).length}\n`);
+    return spawn(wrapped.cmd, wrapped.args, {
+      // bwrap handles --chdir internally; omit node's cwd so a missing or
+      // relocated host path doesn't kill spawn before bwrap can remap it.
+      env,
+      stdio: ['ignore', 'pipe', 'pipe'],
+    });
+  }
+
+  // Non-Linux fallback — sandboxing not implemented yet. Note this loudly so
+  // the user isn't blindsided; the UI also shows a warning via /sandbox-status.
+  process.stderr.write(`[claude] WARNING: no sandbox on ${process.platform}; running on host\n`);
   return spawn(bin, claudeArgs, {
     cwd,
     env,
@@ -1086,6 +1172,13 @@ async function route(req, res, { sandboxRoot }) {
     return json(res, 200, await getDockerStatus());
   }
 
+  // Is bubblewrap available? Powers the Security tab's Default-mode status
+  // pill. On non-Linux the UI shows "not sandboxed on this OS"; on Linux
+  // without bwrap it shows install hints for the current distro family.
+  if (req.method === 'GET' && p === '/sandbox-status') {
+    return json(res, 200, detectSandbox());
+  }
+
   // Usage blobs — runs `claude -p "/<name>"` and returns whatever it prints.
   // `name` is one of cost | usage | stats (the three slash commands that
   // surface usage info in the TUI). Output is raw text; the UI just shows it.
@@ -1112,11 +1205,17 @@ async function route(req, res, { sandboxRoot }) {
     return streamInstallClaude(res);
   }
 
-  // Open the user's terminal with `claude` running so they can sign in
-  // interactively. Auth is OAuth-based and needs a real TTY for the prompt
-  // exchange — easier to lean on the system terminal than to ship a PTY.
+  // Open the user's terminal with `claude auth login` running so they can sign
+  // in interactively. Auth is OAuth-based and needs a real TTY for the prompt
+  // exchange — easier to lean on the system terminal than to ship a PTY. We
+  // invoke the dedicated `auth login` subcommand so the user lands on the
+  // OAuth prompt immediately, without going through the first-run TUI
+  // onboarding (theme picker, etc.) that plain `claude` triggers.
   if (req.method === 'POST' && p === '/open-claude-terminal') {
-    return openClaudeTerminal(res);
+    return openClaudeTerminal(res, {
+      hint: 'Signing you in to Claude. Follow the prompts below.',
+      args: ['auth', 'login'],
+    });
   }
 
   if (req.method === 'POST' && p === '/sessions') {
@@ -1127,6 +1226,19 @@ async function route(req, res, { sandboxRoot }) {
     const resumeClaudeSessionId = typeof body.claudeSessionId === 'string' && body.claudeSessionId.trim()
       ? body.claudeSessionId.trim()
       : null;
+    // Optional client-side stable key (typically the renderer's chat.id). Used
+    // to derive a stable ephemeral cwd so `claude --resume` keeps working
+    // across app restarts: the CLI stores session jsonl under a cwd-keyed
+    // path in ~/.claude/projects, and that lookup breaks if the cwd differs.
+    const clientRef = typeof body.clientRef === 'string'
+      ? body.clientRef.replace(/[^A-Za-z0-9._-]/g, '').slice(0, 64)
+      : '';
+
+    const sandboxRootResolved = path.resolve(sandboxRoot);
+    const underSandboxRoot = (abs) => {
+      const r = path.resolve(abs);
+      return r === sandboxRootResolved || r.startsWith(sandboxRootResolved + path.sep);
+    };
 
     let cwd;
     let managed;
@@ -1135,20 +1247,36 @@ async function route(req, res, { sandboxRoot }) {
       if (!path.isAbsolute(requested)) {
         return json(res, 400, { error: 'cwd must be an absolute path' });
       }
-      let st;
-      try { st = fs.statSync(requested); } catch {
-        return json(res, 400, { error: `cwd does not exist: ${requested}` });
+      const resolved = path.resolve(requested);
+      let st = null;
+      try { st = fs.statSync(resolved); } catch { /* missing */ }
+      if (!st) {
+        // If the cwd lives under sandboxRoot (we created it before, it got
+        // GC'd, or the app restarted and the chat is reconnecting), we own
+        // that territory and can safely recreate it. Anything outside
+        // sandboxRoot must already exist — we don't create user folders.
+        if (underSandboxRoot(resolved)) {
+          try { fs.mkdirSync(resolved, { recursive: true }); } catch (e) {
+            return json(res, 500, { error: `failed to create cwd: ${e.message}` });
+          }
+        } else {
+          return json(res, 400, { error: `cwd does not exist: ${resolved}` });
+        }
+      } else if (!st.isDirectory()) {
+        return json(res, 400, { error: `cwd is not a directory: ${resolved}` });
       }
-      if (!st.isDirectory()) {
-        return json(res, 400, { error: `cwd is not a directory: ${requested}` });
-      }
-      cwd = path.resolve(requested);
-      managed = false;
+      cwd = resolved;
+      // "managed" means backend owns the directory's lifecycle. Anything we
+      // create (or that lives under sandboxRoot) is managed; user-attached
+      // folders aren't.
+      managed = underSandboxRoot(resolved);
     } else {
       // Chat mode (or cowork-without-folder) uses an ephemeral cwd under
-      // sandboxRoot. Chat mode never actually touches it, but the CLI still
-      // needs a working directory to spawn in.
-      cwd = path.join(sandboxRoot, id);
+      // sandboxRoot. Derive the directory name from clientRef when provided
+      // (stable across restarts, so --resume can locate the session jsonl),
+      // otherwise fall back to a fresh per-call id.
+      const dirName = clientRef ? `c-${clientRef}` : id;
+      cwd = path.join(sandboxRoot, dirName);
       fs.mkdirSync(cwd, { recursive: true });
       managed = true;
     }

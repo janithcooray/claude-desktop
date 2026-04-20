@@ -5,7 +5,10 @@ import FilesPanel from './components/FilesPanel.jsx';
 import StatusBar from './components/StatusBar.jsx';
 import SettingsModal from './components/SettingsModal.jsx';
 import DisclaimerModal from './components/DisclaimerModal.jsx';
+import SignInModal from './components/SignInModal.jsx';
+import InstallModal from './components/InstallModal.jsx';
 import { createApiSession, getBackendEnvInfo, getHealth, setBaseUrl, getAuthStatus } from './lib/api.js';
+import { streamChat } from './hooks/useStreamChat.js';
 
 export default function App() {
   const [backendUrl, setBackendUrl] = useState(null);
@@ -13,13 +16,37 @@ export default function App() {
   const [chats, setChats] = useState([]);
   const [activeChatId, setActiveChatId] = useState(null);
   const [messages, setMessages] = useState([]); // messages for the active chat
-  const [liveFiles, setLiveFiles] = useState([]); // files emitted during current turn
+  // In-flight streaming state, keyed by chatId so it survives ChatView
+  // remounts when the user switches chats mid-turn.
+  //   liveByChat[id]      — current assistant draft (content/events/files)
+  //   liveFilesByChat[id] — files emitted so far for the FilesPanel overlay
+  //   streamingIds        — which chats currently have an open stream
+  // Abort controllers are tracked on a ref because they're not render data.
+  const [liveByChat, setLiveByChat] = useState({});
+  const [liveFilesByChat, setLiveFilesByChat] = useState({});
+  const [streamingIds, setStreamingIds] = useState(() => new Set());
+  const streamAbortersRef = useRef(new Map());
+  // Shadow of `activeChatId` for use inside async callbacks that outlive the
+  // chat switch (e.g. the stream handler checking "am I still the visible
+  // chat?" before reloading messages for it).
+  const activeChatIdRef = useRef(null);
   const [graphOk, setGraphOk] = useState(null);
   const [settingsOpen, setSettingsOpen] = useState(false);
   // /info snapshot — whether the CLI is installed and signed in. Drives the
   // onboarding banner that prompts the user to install / sign in on first run.
   const [cliEnv, setCliEnv] = useState(null);
   const [cliBannerDismissed, setCliBannerDismissed] = useState(false);
+  // Controls the sign-in explainer modal. Auto-opens once per app run when we
+  // first see the CLI is installed-but-signed-out (and the disclaimer has been
+  // acknowledged). `autoOpened` keeps us from re-opening it after the user
+  // dismisses, even if /info still reports logged_out on the next poll.
+  const [signInOpen, setSignInOpen] = useState(false);
+  const [signInAutoOpened, setSignInAutoOpened] = useState(false);
+  // Controls the install explainer modal. Same auto-open-once discipline as
+  // sign-in, but install takes priority: if the bin is missing, we don't show
+  // the sign-in modal at all until the install completes.
+  const [installOpen, setInstallOpen] = useState(false);
+  const [installAutoOpened, setInstallAutoOpened] = useState(false);
   // Parsed `claude auth status` output. Used for the sidebar's account badge
   // so the user sees which email + plan their Claude chats are running as.
   const [account, setAccount] = useState(null);
@@ -119,6 +146,42 @@ export default function App() {
     return () => { stopped = true; clearInterval(t); };
   }, [backendUrl, settingsOpen]);
 
+  // First-thing install prompt. If the CLI binary isn't on the user's machine,
+  // nothing else works — sign-in, chatting, all of it fails with ENOENT — so
+  // the install modal takes priority over the sign-in modal. Fires once per
+  // app run, gated on the disclaimer being acknowledged.
+  useEffect(() => {
+    if (disclaimerOk !== true) return;
+    if (installAutoOpened) return;
+    if (!cliEnv) return;
+    if (cliEnv.binExists !== false) return; // bin exists or unknown: nothing to do
+    setInstallAutoOpened(true);
+    setInstallOpen(true);
+  }, [cliEnv, disclaimerOk, installAutoOpened]);
+
+  // First-thing sign-in prompt. When the CLI is installed but the user is
+  // signed out, auto-open the explainer modal once — but only after the
+  // disclaimer is out of the way, so we never stack two modals. We flip
+  // `signInAutoOpened` the first time it triggers so dismissing doesn't cause
+  // the modal to pop right back the moment /info re-polls.
+  //
+  // We check `account.loggedIn` (from `claude auth status`) because it's the
+  // authoritative signal — `cliEnv.login.status` can report 'unknown' when
+  // ~/.claude exists but credentials live in the keychain or haven't been
+  // written yet, which would hide the modal for users who need it most.
+  useEffect(() => {
+    if (disclaimerOk !== true) return;
+    if (signInAutoOpened) return;
+    if (installOpen) return; // install modal is active; don't stack
+    // Need both signals loaded before deciding — otherwise we'd flash the
+    // modal open then immediately close it when the real state arrives.
+    if (!cliEnv || !account) return;
+    if (cliEnv.binExists === false) return; // install flow owns this case
+    if (account.loggedIn !== false) return; // true or indeterminate: leave alone
+    setSignInAutoOpened(true);
+    setSignInOpen(true);
+  }, [cliEnv, account, disclaimerOk, signInAutoOpened, installOpen]);
+
   // Separately fetch the richer `claude auth status` output for the sidebar
   // badge. Throttled to once per backend-ready / settings-close cycle so we
   // don't spawn the CLI on a timer.
@@ -134,16 +197,21 @@ export default function App() {
     return () => { stopped = true; };
   }, [backendUrl, settingsOpen]);
 
-  // Load messages when active chat changes
+  // Keep the ref in sync with state so async callbacks see the current value.
   useEffect(() => {
-    if (!activeChatId) { setMessages([]); setLiveFiles([]); return; }
+    activeChatIdRef.current = activeChatId;
+  }, [activeChatId]);
+
+  // Load messages when active chat changes. We deliberately DON'T touch
+  // liveByChat / liveFilesByChat here — those are per-chat and must survive
+  // chat-switching (that's the whole reason they exist). Only the DB-backed
+  // `messages` list is chat-scoped active state.
+  useEffect(() => {
+    if (!activeChatId) { setMessages([]); return; }
     let cancelled = false;
     (async () => {
       const list = await window.cowork.db.listMessages(activeChatId);
-      if (!cancelled) {
-        setMessages(list);
-        setLiveFiles([]);
-      }
+      if (!cancelled) setMessages(list);
     })();
     return () => { cancelled = true; };
   }, [activeChatId]);
@@ -271,6 +339,11 @@ export default function App() {
     }
     if (chat.model) opts.model = chat.model;
     if (chat.claudeSessionId) opts.claudeSessionId = chat.claudeSessionId;
+    // Stable key: tells the backend to keep using the same ephemeral cwd for
+    // this chat across restarts. Without this, the CLI's `--resume` lookup
+    // breaks because it's keyed by cwd and the backend would otherwise mint a
+    // new random cwd every time the session registry was lost.
+    opts.clientRef = chat.id;
 
     // Fold in app-wide Claude Code defaults for cowork sessions. Chat mode
     // hard-locks the tool surface already, so permission-mode / tool lists
@@ -307,47 +380,127 @@ export default function App() {
     return updated;
   }, [backendUrl]);
 
-  // Resume a CLI history session as a new cowork chat. The backend's
-  // /claude-history endpoint returns sessions keyed by their .jsonl file —
-  // we feed the session UUID back via claudeSessionId so the CLI's --resume
-  // picks up the conversation, and use the project path as the sandbox.
-  const handleResumeHistory = useCallback(async (entry) => {
-    await handleNewChat('cowork', {
-      title: entry.title || 'Resumed',
-      claudeSessionId: entry.id,
-      sandboxPath: entry.projectPath || null,
-      skipFolderPrompt: true,
-    });
-  }, [handleNewChat]);
+  // Owns the whole turn lifecycle: persist user message, open the SSE stream,
+  // accumulate the assistant draft in `liveByChat[chat.id]`, and on stream
+  // close persist the final assistant message and title-from-prompt.
+  //
+  // State lives here (not in ChatView) so switching chats mid-turn doesn't
+  // throw away the draft. The user message is persisted to the DB up front
+  // rather than only-after-the-turn — that way if the user switches away and
+  // back, their own input is still visible even before the assistant replies.
+  const handleSend = useCallback(async ({ chat, prompt, userDisplay }) => {
+    if (!chat) return;
+    const chatId = chat.id;
+    // Prevent two concurrent turns on the same chat — the backend would
+    // handle it (each turn is its own POST), but the UI isn't set up to show
+    // two drafts at once.
+    if (streamAbortersRef.current.has(chatId)) return;
 
-  // Called by ChatView when the user sends a prompt.
-  const handleSent = useCallback(async ({ chatId, userMessage, assistantResult }) => {
-    // Persist the user message (already added optimistically)
-    await window.cowork.db.appendMessage(chatId, { role: 'user', content: userMessage });
-    // Persist the assistant message
-    const saved = await window.cowork.db.appendMessage(chatId, {
+    const updated = await ensureApiSession(chat);
+    const apiSessionId = updated?.apiSessionId;
+    if (!apiSessionId) return;
+
+    // Persist the user message immediately so it survives any remount /
+    // navigation away from this chat.
+    const userContent = userDisplay || prompt;
+    await window.cowork.db.appendMessage(chatId, { role: 'user', content: userContent });
+    // If this chat is currently displayed, reload so the user sees the real
+    // persisted row (with a real id) right away.
+    if (activeChatIdRef.current === chatId) {
+      const list = await window.cowork.db.listMessages(chatId);
+      setMessages(list);
+    }
+
+    // Seed the draft under this chat.
+    const draft = {
+      id: 'tmp-a-' + Date.now(),
+      chatId,
       role: 'assistant',
-      content: assistantResult.text,
-      events: assistantResult.events,
-      files: assistantResult.files,
-    });
-    if (assistantResult.claudeSessionId) {
-      await window.cowork.db.updateChat(chatId, {
-        claudeSessionId: assistantResult.claudeSessionId,
+      content: '',
+      events: [],
+      files: [],
+      createdAt: Date.now(),
+    };
+    setLiveByChat((m) => ({ ...m, [chatId]: draft }));
+    setLiveFilesByChat((m) => ({ ...m, [chatId]: [] }));
+    setStreamingIds((s) => { const n = new Set(s); n.add(chatId); return n; });
+
+    const controller = new AbortController();
+    streamAbortersRef.current.set(chatId, controller);
+
+    let accText = '';
+    const accEvents = [];
+    const accFiles = [];
+
+    try {
+      const result = await streamChat({
+        apiSessionId,
+        prompt,
+        model: chat.model || null,
+        signal: controller.signal,
+        onEvent: (evt) => {
+          accEvents.push(evt);
+          if (evt.event === 'assistant_text') {
+            accText += evt.data?.text ?? '';
+          } else if (evt.event === 'file_event') {
+            const d = evt.data || {};
+            if (d.kind === 'deleted') {
+              const i = accFiles.findIndex((f) => f.path === d.path);
+              if (i >= 0) accFiles.splice(i, 1);
+            } else {
+              const i = accFiles.findIndex((f) => f.path === d.path);
+              const entry = { path: d.path, url: d.url, kind: d.kind, at: Date.now() };
+              if (i >= 0) accFiles[i] = entry; else accFiles.push(entry);
+            }
+            setLiveFilesByChat((m) => ({ ...m, [chatId]: accFiles.slice() }));
+          }
+          setLiveByChat((m) => ({
+            ...m,
+            [chatId]: { ...draft, content: accText, events: accEvents.slice(), files: accFiles.slice() },
+          }));
+        },
       });
+
+      // Persist the assistant message and any session-id update from the CLI.
+      await window.cowork.db.appendMessage(chatId, {
+        role: 'assistant',
+        content: result.text,
+        events: result.events,
+        files: result.files,
+      });
+      if (result.claudeSessionId) {
+        await window.cowork.db.updateChat(chatId, {
+          claudeSessionId: result.claudeSessionId,
+        });
+      }
+      // Title-from-prompt if the chat still has the default.
+      const cur = await window.cowork.db.getChat(chatId);
+      const defaultTitles = new Set(['New chat', 'New cowork']);
+      if (cur && defaultTitles.has(cur.title) && userContent.trim()) {
+        const title = userContent.trim().slice(0, 48).replace(/\s+/g, ' ');
+        await window.cowork.db.updateChat(chatId, { title });
+      }
+      await refreshChats();
+      // If the user is still looking at this chat, refresh messages so they
+      // see the persisted assistant row (with a real id).
+      if (activeChatIdRef.current === chatId) {
+        const list = await window.cowork.db.listMessages(chatId);
+        setMessages(list);
+      }
+    } finally {
+      // Clear the per-chat stream state regardless of success/abort/error.
+      streamAbortersRef.current.delete(chatId);
+      setLiveByChat((m) => { const n = { ...m }; delete n[chatId]; return n; });
+      setLiveFilesByChat((m) => { const n = { ...m }; delete n[chatId]; return n; });
+      setStreamingIds((s) => { const n = new Set(s); n.delete(chatId); return n; });
     }
-    // If the chat still has the default title, make one from the prompt.
-    const cur = await window.cowork.db.getChat(chatId);
-    const defaultTitles = new Set(['New chat', 'New cowork']);
-    if (cur && defaultTitles.has(cur.title) && userMessage.trim()) {
-      const title = userMessage.trim().slice(0, 48).replace(/\s+/g, ' ');
-      await window.cowork.db.updateChat(chatId, { title });
-    }
-    await refreshChats();
-    // Refresh messages so user sees the persisted versions (with real ids)
-    const list = await window.cowork.db.listMessages(chatId);
-    setMessages(list);
-  }, [refreshChats]);
+  }, [ensureApiSession, refreshChats]);
+
+  // Stop the in-flight turn for a specific chat (the composer's stop button).
+  const handleStop = useCallback((chatId) => {
+    const c = streamAbortersRef.current.get(chatId);
+    if (c) c.abort();
+  }, []);
 
   if (backendError) {
     return (
@@ -388,7 +541,11 @@ export default function App() {
           </div>
           <button
             type="button"
-            onClick={() => setSettingsOpen(true)}
+            onClick={() => {
+              // Both flows have dedicated explainer modals now.
+              if (cliBinMissing) setInstallOpen(true);
+              else setSignInOpen(true);
+            }}
             className="text-[11px] font-medium px-2.5 py-1 rounded bg-accent-500 text-ink-950 hover:bg-accent-400"
           >
             {cliBinMissing ? 'Install' : 'Sign in'}
@@ -411,36 +568,67 @@ export default function App() {
           onNew={handleNewChat}
           onDelete={handleDeleteChat}
           onOpenSettings={() => setSettingsOpen(true)}
-          onResumeHistory={handleResumeHistory}
           account={account}
         />
         <ChatView
           key={activeChatId || 'empty'}
           chat={activeChat}
           messages={messages}
-          setMessages={setMessages}
+          liveMessage={activeChatId ? (liveByChat[activeChatId] || null) : null}
+          isStreaming={activeChatId ? streamingIds.has(activeChatId) : false}
+          onSubmit={handleSend}
+          onStop={() => activeChatId && handleStop(activeChatId)}
           onEnsureApiSession={ensureApiSession}
           onModelChange={(model) => activeChatId && handleModelChange(activeChatId, model)}
           onAddFolders={handleAddFolders}
           onRemoveFolder={handleRemoveFolder}
-          onSent={handleSent}
-          onLiveFiles={setLiveFiles}
           backendReady={!!backendUrl}
         />
         {activeChat?.mode !== 'chat' && (
           <FilesPanel
             chat={activeChat}
             messages={messages}
-            liveFiles={liveFiles}
+            liveFiles={activeChatId ? (liveFilesByChat[activeChatId] || []) : []}
           />
         )}
       </div>
       <StatusBar backendUrl={backendUrl} graphOk={graphOk} chat={activeChat} />
       {settingsOpen && (
-        <SettingsModal onClose={() => setSettingsOpen(false)} />
+        <SettingsModal
+          onClose={() => setSettingsOpen(false)}
+          onRequestSignIn={() => {
+            // Close Settings first so the explainer isn't stacked on top of
+            // another modal — user sees a clean single-modal flow.
+            setSettingsOpen(false);
+            setSignInOpen(true);
+          }}
+        />
       )}
       {disclaimerOk === false && (
         <DisclaimerModal onAcknowledge={() => setDisclaimerOk(true)} />
+      )}
+      {signInOpen && (
+        <SignInModal onClose={() => setSignInOpen(false)} />
+      )}
+      {installOpen && (
+        <InstallModal
+          onClose={() => setInstallOpen(false)}
+          onInstalled={(result) => {
+            // Fold the fresh /info payload into state immediately so the sign-in
+            // effect has current data (the 20s poll is too slow for a good
+            // hand-off). Then close Install, open Sign-in.
+            if (result?.info) setCliEnv(result.info);
+            setInstallOpen(false);
+            // If the installer's post-run /info says already signed in, skip
+            // straight past the sign-in modal — rare but possible if the user
+            // had credentials from a previous install.
+            const alreadySignedIn = result?.info?.login?.status === 'logged_in';
+            if (!alreadySignedIn) {
+              setSignInAutoOpened(true); // claim the auto-open slot
+              setSignInOpen(true);
+            }
+          }}
+        />
       )}
     </div>
   );

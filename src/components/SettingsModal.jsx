@@ -2,10 +2,10 @@ import React, { useEffect, useRef, useState } from 'react';
 import {
   getBackendEnvInfo,
   installClaudeCli,
-  openClaudeSignInTerminal,
   getAuthStatus,
   openClaudeConfigTerminal,
   getDockerStatus,
+  getSandboxStatus,
 } from '../lib/api.js';
 
 // Two-pane settings modal with a left nav. Sections grow as we wire up more
@@ -18,7 +18,12 @@ const SECTIONS = [
   { id: 'security',    label: 'Security' },
 ];
 
-export default function SettingsModal({ onClose }) {
+// `onRequestSignIn` is called when the user clicks any in-modal "Sign in"
+// button. It lets the parent own the sign-in explainer flow so the same
+// step-by-step popup fires regardless of where the click came from (launch
+// banner, account tab, bootstrap card). If not provided, the sign-in CTAs
+// are hidden rather than silently no-oping.
+export default function SettingsModal({ onClose, onRequestSignIn }) {
   const [section, setSection] = useState('general');
   const [env, setEnv] = useState(null);
   const [app, setApp] = useState(null);
@@ -116,9 +121,9 @@ export default function SettingsModal({ onClose }) {
 
           <div className="flex-1 overflow-y-auto px-6 py-5">
             {section === 'general' && (
-              <GeneralSection env={env} app={app} err={err} onRefresh={load} />
+              <GeneralSection env={env} app={app} err={err} onRefresh={load} onRequestSignIn={onRequestSignIn} />
             )}
-            {section === 'account' && <AccountSection />}
+            {section === 'account' && <AccountSection onRequestSignIn={onRequestSignIn} />}
             {section === 'claude-code' && <ClaudeCodeSection />}
             {section === 'security' && <SecuritySection />}
           </div>
@@ -128,7 +133,7 @@ export default function SettingsModal({ onClose }) {
   );
 }
 
-function GeneralSection({ env, app, err, onRefresh }) {
+function GeneralSection({ env, app, err, onRefresh, onRequestSignIn }) {
   const login = env?.login;
   const loginStatus = login?.status || 'unknown';
   const loginBadgeClass =
@@ -185,7 +190,7 @@ function GeneralSection({ env, app, err, onRefresh }) {
           )}
         </Row>
 
-        <ClaudeBootstrap env={env} onRefresh={onRefresh} />
+        <ClaudeBootstrap env={env} onRefresh={onRefresh} onRequestSignIn={onRequestSignIn} />
 
         <Hint>
           Override the binary by setting <code className="font-mono text-ink-300">CLAUDE_BIN</code> in your shell before launching.
@@ -222,7 +227,7 @@ function GeneralSection({ env, app, err, onRefresh }) {
 
 // --- Account --------------------------------------------------------------
 
-function AccountSection() {
+function AccountSection({ onRequestSignIn }) {
   const [status, setStatus] = useState(null);
   const [loading, setLoading] = useState(false);
   const [err, setErr] = useState(null);
@@ -294,9 +299,9 @@ function AccountSection() {
           )}
         </div>
 
-        {!signedIn && status?.binExists && (
+        {!signedIn && status?.binExists && onRequestSignIn && (
           <div className="mt-4 pt-3 border-t border-ink-700/40">
-            <SignInButton onDone={load} />
+            <SignInButton onRequestSignIn={onRequestSignIn} />
           </div>
         )}
 
@@ -527,6 +532,8 @@ function SecuritySection() {
   const [prefs, setPrefs] = useState(null);
   const [docker, setDocker] = useState(null);
   const [dockerLoading, setDockerLoading] = useState(false);
+  const [sandbox, setSandbox] = useState(null);
+  const [sandboxLoading, setSandboxLoading] = useState(false);
   const [saving, setSaving] = useState(false);
   const [saveNote, setSaveNote] = useState(null);
   const [err, setErr] = useState(null);
@@ -544,6 +551,18 @@ function SecuritySection() {
     }
   };
 
+  const refreshSandbox = async () => {
+    setSandboxLoading(true);
+    try {
+      const s = await getSandboxStatus();
+      setSandbox(s);
+    } catch (e) {
+      setSandbox({ available: false, reason: String(e?.message || e) });
+    } finally {
+      setSandboxLoading(false);
+    }
+  };
+
   useEffect(() => {
     (async () => {
       try {
@@ -554,6 +573,7 @@ function SecuritySection() {
       }
     })();
     refreshDocker();
+    refreshSandbox();
   }, []);
 
   if (!prefs) return <div className="text-sm text-ink-500">Loading…</div>;
@@ -604,10 +624,65 @@ function SecuritySection() {
           current={currentMode}
           onSelect={selectMode}
           title="Default (recommended)"
-          badge={<span className="text-[10.5px] px-1.5 py-0.5 rounded bg-emerald-500/15 text-emerald-400 border border-emerald-500/40">Safe</span>}
+          badge={
+            sandboxLoading
+              ? <Pill tone="muted">Checking…</Pill>
+              : sandbox?.available
+                ? <Pill tone="ok">Sandboxed{sandbox.tool ? ` (${sandbox.tool})` : ''}</Pill>
+                : sandbox?.platform === 'linux'
+                  ? <Pill tone="warn">bwrap missing</Pill>
+                  : <Pill tone="warn">Host spawn</Pill>
+          }
         >
-          Runs on your host with the CLI&rsquo;s permission prompts. Tool calls honour the allow-list
-          configured in <em>Claude Code</em> settings.
+          <div>
+            Wraps each cowork session in an unprivileged{' '}
+            <code className="font-mono text-ink-200">bubblewrap</code> sandbox. Only the folders you
+            attach (plus <code className="font-mono text-ink-200">~/.claude</code> for credentials)
+            are visible — the rest of your home directory is hidden behind a tmpfs. The CLI&rsquo;s
+            own permission prompts still apply on top.
+          </div>
+          {!sandboxLoading && sandbox && !sandbox.available && sandbox.platform === 'linux' && (
+            <div className="mt-3 rounded-md bg-amber-500/10 border border-amber-500/40 px-3 py-2">
+              <div className="text-[12px] text-amber-400 font-medium mb-1">
+                Sandbox not available — {sandbox.reason || 'bubblewrap not installed'}
+              </div>
+              <div className="text-[11px] text-ink-300 mb-2">
+                Default mode will refuse to start until <code className="font-mono text-ink-100">bwrap</code>{' '}
+                is installed. Pick the command for your distribution:
+              </div>
+              {sandbox.installHints && (
+                <div className="space-y-0.5">
+                  {Object.entries(sandbox.installHints).map(([family, cmd]) => (
+                    <div key={family} className="flex text-[11px] font-mono">
+                      <span className="text-ink-500 w-[24ch] shrink-0">{family}</span>
+                      <span className="text-ink-100">{cmd}</span>
+                    </div>
+                  ))}
+                </div>
+              )}
+            </div>
+          )}
+          {!sandboxLoading && sandbox && !sandbox.available && sandbox.platform !== 'linux' && (
+            <div className="mt-3 rounded-md bg-amber-500/10 border border-amber-500/40 px-3 py-2 text-[11.5px] text-amber-400">
+              {sandbox.reason || `Sandboxing is not implemented on ${sandbox.platform} yet.`}
+              {' '}Default mode still runs, but on the host — prefer Docker mode if you need real isolation.
+            </div>
+          )}
+          {!sandboxLoading && sandbox?.available && (
+            <div className="mt-2 text-[11px] text-ink-500 font-mono truncate" title={sandbox.path}>
+              {sandbox.path}{sandbox.version ? `  ·  v${sandbox.version}` : ''}
+            </div>
+          )}
+          <div className="mt-2">
+            <button
+              type="button"
+              onClick={refreshSandbox}
+              disabled={sandboxLoading}
+              className="text-[11px] text-ink-400 hover:text-ink-100 disabled:opacity-50 px-2 py-1 rounded hover:bg-ink-800"
+            >
+              {sandboxLoading ? 'Checking sandbox…' : 'Re-check sandbox'}
+            </button>
+          </div>
         </ModeOption>
 
         <ModeOption
@@ -838,51 +913,30 @@ function walk(obj, dottedKey) {
 }
 
 // Inline sign-in button reused by the Account section when the user isn't
-// logged in. Mirrors the General > ClaudeBootstrap button.
-function SignInButton({ onDone }) {
-  const [busy, setBusy] = useState(false);
-  const [detail, setDetail] = useState(null);
-  const [err, setErr] = useState(null);
-  const run = async () => {
-    setBusy(true);
-    setDetail(null);
-    setErr(null);
-    try {
-      const j = await openClaudeSignInTerminal();
-      setDetail(`Opened in ${j.terminal}. Follow the prompts, then come back and hit Refresh.`);
-    } catch (e) {
-      setErr(String(e?.message || e));
-    } finally {
-      setBusy(false);
-      onDone?.();
-    }
-  };
+// logged in. Mirrors the General > ClaudeBootstrap button. Delegates the
+// actual terminal spawn to the parent-owned SignInModal so the user gets the
+// same explainer regardless of entry point.
+function SignInButton({ onRequestSignIn }) {
   return (
-    <div>
-      <button
-        type="button"
-        onClick={run}
-        disabled={busy}
-        className="text-xs px-3 py-1.5 rounded-md bg-accent-500 text-ink-950 font-medium hover:bg-accent-400 disabled:opacity-60"
-      >
-        {busy ? 'Opening terminal…' : 'Sign in to Claude'}
-      </button>
-      {detail && <div className="mt-2 text-[11px] text-ink-400">{detail}</div>}
-      {err && <div className="mt-2 text-[11px] text-accent-500 break-all">{err}</div>}
-    </div>
+    <button
+      type="button"
+      onClick={() => onRequestSignIn?.()}
+      className="text-xs px-3 py-1.5 rounded-md bg-accent-500 text-ink-950 font-medium hover:bg-accent-400"
+    >
+      Sign in to Claude
+    </button>
   );
 }
 
 // Inline install + sign-in affordances. Rendered inside the Claude CLI card so
 // the user can recover in one click if the binary is missing or not logged in.
-function ClaudeBootstrap({ env, onRefresh }) {
+// Sign-in is delegated up to the parent (SignInModal explainer); install runs
+// inline because it's a long-running streamed operation that needs log output.
+function ClaudeBootstrap({ env, onRefresh, onRequestSignIn }) {
   const [installing, setInstalling] = useState(false);
   const [installLog, setInstallLog] = useState('');
   const [installErr, setInstallErr] = useState(null);
   const [installDone, setInstallDone] = useState(null); // { exitCode }
-  const [signInBusy, setSignInBusy] = useState(false);
-  const [signInDetail, setSignInDetail] = useState(null);
-  const [signInErr, setSignInErr] = useState(null);
   const logRef = useRef(null);
 
   const binMissing = env && env.binExists === false;
@@ -914,23 +968,9 @@ function ClaudeBootstrap({ env, onRefresh }) {
     }
   };
 
-  const runSignIn = async () => {
-    setSignInBusy(true);
-    setSignInDetail(null);
-    setSignInErr(null);
-    try {
-      const j = await openClaudeSignInTerminal();
-      setSignInDetail(`Opened in ${j.terminal}. Follow the prompts, then come back and hit Refresh.`);
-    } catch (e) {
-      setSignInErr(String(e?.message || e));
-    } finally {
-      setSignInBusy(false);
-    }
-  };
-
   // Nothing to do — binary present and signed in. Hide the block entirely so
   // the card stays clean in the happy path.
-  if (!binMissing && !notSignedIn && !installing && !installLog && !signInDetail) {
+  if (!binMissing && !notSignedIn && !installing && !installLog) {
     return null;
   }
 
@@ -953,25 +993,18 @@ function ClaudeBootstrap({ env, onRefresh }) {
         </div>
       )}
 
-      {notSignedIn && !binMissing && (
+      {notSignedIn && !binMissing && onRequestSignIn && (
         <div>
           <div className="text-xs text-ink-300 mb-2">
             You&rsquo;re not signed in to the Claude CLI. Sign in once in a terminal window and you&rsquo;re set.
           </div>
           <button
             type="button"
-            onClick={runSignIn}
-            disabled={signInBusy}
-            className="text-xs px-3 py-1.5 rounded-md bg-accent-500 text-ink-950 font-medium hover:bg-accent-400 disabled:opacity-60"
+            onClick={() => onRequestSignIn()}
+            className="text-xs px-3 py-1.5 rounded-md bg-accent-500 text-ink-950 font-medium hover:bg-accent-400"
           >
-            {signInBusy ? 'Opening terminal…' : 'Sign in to Claude'}
+            Sign in to Claude
           </button>
-          {signInDetail && (
-            <div className="mt-2 text-[11px] text-ink-400">{signInDetail}</div>
-          )}
-          {signInErr && (
-            <div className="mt-2 text-[11px] text-accent-500 break-all">{signInErr}</div>
-          )}
         </div>
       )}
 
@@ -1004,22 +1037,15 @@ function ClaudeBootstrap({ env, onRefresh }) {
 
       {/* Once installed, offer sign-in in the same block so the user doesn't
           have to hunt for it. */}
-      {installDone?.exitCode === 0 && installDone?.info?.login?.status !== 'logged_in' && (
+      {installDone?.exitCode === 0 && installDone?.info?.login?.status !== 'logged_in' && onRequestSignIn && (
         <div>
           <button
             type="button"
-            onClick={runSignIn}
-            disabled={signInBusy}
-            className="text-xs px-3 py-1.5 rounded-md bg-accent-500 text-ink-950 font-medium hover:bg-accent-400 disabled:opacity-60"
+            onClick={() => onRequestSignIn()}
+            className="text-xs px-3 py-1.5 rounded-md bg-accent-500 text-ink-950 font-medium hover:bg-accent-400"
           >
-            {signInBusy ? 'Opening terminal…' : 'Sign in to Claude'}
+            Sign in to Claude
           </button>
-          {signInDetail && (
-            <div className="mt-2 text-[11px] text-ink-400">{signInDetail}</div>
-          )}
-          {signInErr && (
-            <div className="mt-2 text-[11px] text-accent-500 break-all">{signInErr}</div>
-          )}
         </div>
       )}
     </div>

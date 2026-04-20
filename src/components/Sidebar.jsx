@@ -1,5 +1,4 @@
-import React, { useEffect, useMemo, useState } from 'react';
-import { getClaudeHistory } from '../lib/api.js';
+import React, { useMemo, useState } from 'react';
 
 function formatRelative(ts) {
   if (!ts) return '';
@@ -15,9 +14,7 @@ function formatRelative(ts) {
 }
 
 // Top-level tab switcher: Chats vs Cowork.
-//   Chats — direct Claude conversation, no tools. Also surfaces CLI history
-//           (sessions previously run via the `claude` binary), which can be
-//           resumed as a new cowork chat.
+//   Chats — direct Claude conversation, no tools.
 //   Cowork — agentic; each chat has a sandbox folder picked at creation.
 export default function Sidebar({
   chats,
@@ -26,7 +23,6 @@ export default function Sidebar({
   onNew,
   onDelete,
   onOpenSettings,
-  onResumeHistory,
   account,
 }) {
   // The tab is purely a user-controlled view filter. It no longer follows the
@@ -106,7 +102,7 @@ export default function Sidebar({
         )}
         {items.length === 0 && tab === 'chat' && (
           <div className="px-3 py-3 text-[11px] text-ink-500">
-            Direct Claude conversation, no tools or files. Local CLI history below can be resumed.
+            Direct Claude conversation, no tools or files.
           </div>
         )}
         {items.map((chat) => (
@@ -119,10 +115,6 @@ export default function Sidebar({
             showFolder={tab !== 'chat'}
           />
         ))}
-
-        {tab === 'chat' && (
-          <ClaudeHistorySection onResume={onResumeHistory} />
-        )}
       </div>
 
       <div className="border-t border-ink-700/60 px-2 py-2">
@@ -245,74 +237,3 @@ function ChatRow({ chat, active, onSelect, onDelete, showFolder }) {
   );
 }
 
-// Reads the local CLI's saved sessions from ~/.claude/projects/. These are
-// the same chats the `claude` binary keeps for --resume. Resuming creates a
-// new cowork chat seeded with the session UUID + project cwd.
-function ClaudeHistorySection({ onResume }) {
-  const [items, setItems] = useState(null); // null = loading, [] = empty
-  const [err, setErr] = useState(null);
-  const [expanded, setExpanded] = useState(true);
-
-  useEffect(() => {
-    let cancelled = false;
-    (async () => {
-      try {
-        const r = await getClaudeHistory(50);
-        if (!cancelled) setItems(r?.sessions || []);
-      } catch (x) {
-        if (!cancelled) {
-          setErr(String(x?.message || x));
-          setItems([]);
-        }
-      }
-    })();
-    return () => { cancelled = true; };
-  }, []);
-
-  return (
-    <div className="mt-3 pt-2 border-t border-ink-700/60">
-      <button
-        type="button"
-        onClick={() => setExpanded((v) => !v)}
-        className="w-full px-3 py-1 flex items-center text-[11px] uppercase tracking-wider text-ink-500 hover:text-ink-300"
-      >
-        <span>{expanded ? '▾' : '▸'}</span>
-        <span className="ml-1">Claude CLI history</span>
-        <div className="flex-1" />
-        {items && <span className="text-ink-600 normal-case tracking-normal">{items.length}</span>}
-      </button>
-      {expanded && (
-        <div className="px-1">
-          {items === null && (
-            <div className="px-3 py-2 text-[11px] text-ink-500">Loading…</div>
-          )}
-          {err && (
-            <div className="px-3 py-2 text-[11px] text-accent-500/80 break-all">{err}</div>
-          )}
-          {items && items.length === 0 && !err && (
-            <div className="px-3 py-2 text-[11px] text-ink-500">
-              No local sessions found in <code className="font-mono">~/.claude/projects</code>.
-            </div>
-          )}
-          {items && items.map((s) => (
-            <button
-              key={s.id}
-              type="button"
-              onClick={() => onResume?.(s)}
-              className="group block w-full text-left mx-1 px-2.5 py-1.5 rounded-md hover:bg-ink-800 transition-colors"
-              title={`Resume session ${s.id}\n${s.projectPath || ''}`}
-            >
-              <div className="text-[12.5px] text-ink-200 truncate">{s.title || s.id.slice(0, 8)}</div>
-              <div className="text-[10.5px] text-ink-500 truncate">
-                {formatRelative(s.updatedAt)}
-                {s.projectPath && (
-                  <span className="ml-1 text-ink-600">· {s.projectPath.split('/').filter(Boolean).pop()}</span>
-                )}
-              </div>
-            </button>
-          ))}
-        </div>
-      )}
-    </div>
-  );
-}

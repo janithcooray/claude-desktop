@@ -1,153 +1,128 @@
-# cowork-desktop
+# Claude Desktop (community build)
 
-A Claude-Desktop-style shell built on Electron. It drives the headless
-`claude` CLI directly from the main process and gives you a chat window that
-looks and feels like Cowork mode.
+An unofficial desktop app for Claude, built as a thin shell around the
+official `claude` CLI. Chat with Claude in a proper window, attach folders
+so it can read and edit your files, and keep full conversation history
+locally — no browser tab, no copy-paste, no cloud sync.
 
-```
-┌──────────────┬──────────────────────────────┬──────────────────┐
-│  Sidebar     │   Chat                       │  Files           │
-│              │                              │                  │
-│  [+ New]     │   user: …                    │  report.md       │
-│  Contracts   │   assistant: …               │  notes.md        │
-│  PDFs notes  │   [▸ 3 tool calls]           │  ─────────────   │
-│  ⋯           │                              │  [preview]       │
-│              │                              │  Open · Save as  │
-│              │   ┌──────────────────────┐   │                  │
-│              │   │ Message Claude…  ➤   │   │                  │
-│              │   └──────────────────────┘   │                  │
-└──────────────┴──────────────────────────────┴──────────────────┘
-  backend: http://127.0.0.1:NNNNN  |  sandbox: /…
-```
+> **Alpha build · community project.** Not affiliated with Anthropic.
+> It drives the real `claude` CLI under the hood, so your account, billing,
+> and rate limits are exactly the same as using `claude` in a terminal.
 
-## How it works
+## What it gives you
 
-* **Electron main** starts a tiny in-process HTTP server on a free loopback
-  port (see `electron/backend.cjs`), then opens the BrowserWindow. No
-  subprocess — the backend is a few hundred lines of Node in the same
-  process as Electron.
-* **Per-turn**, the backend spawns the `claude` CLI headless
-  (`claude -p … --output-format stream-json --verbose`) with its cwd set to
-  the session sandbox. Stdout is parsed line-by-line and translated into SSE
-  events the renderer already understands (`session`, `assistant_text`,
-  `file_event`, `end`, `error`).
-* **SQLite** (`better-sqlite3`) holds your chat list and message history.
-  Per-chat `apiSessionId` + `claudeSessionId` persist across restarts, so
-  Claude resumes the conversation via `--resume`.
-* **Sandboxes** live under the OS user-data dir (e.g. `~/.config/Cowork/sandboxes/<sid>/`
-  on Linux, `~/Library/Application Support/Cowork/…` on macOS). Uploaded
-  files land in `<sandbox>/uploads/`; files Claude writes end up wherever it
-  decides — both are visible in the right panel, thanks to a post-turn
-  snapshot-diff of the sandbox.
-* **Renderer** is React + Vite + Tailwind. It talks to the backend over
-  plain HTTP + SSE; POST-body SSE is consumed with `fetch` + a reader
-  (EventSource can't POST).
-* **Tool allowlist is static** — passed to the CLI via `--allowedTools`.
-  Default: `Read,Write,Edit,Bash,Glob,Grep`. Override with `ALLOWED_TOOLS`.
+- **A real chat window.** Sidebar of chats on the left, conversation in the
+  middle, file previews on the right — everything you'd expect, nothing you
+  wouldn't.
+- **Two modes per chat:**
+  - **Chat** — plain conversation with Claude. No file access, no shell.
+    Good for questions, writing, brainstorming.
+  - **Cowork** — agentic mode. Attach one or more folders and Claude can
+    read, edit, and run code inside them.
+- **Sandboxed by default on Linux.** Cowork turns run inside a bubblewrap
+  sandbox that only exposes the folders you attached — the rest of your
+  home directory is hidden from Claude. Docker and fully unrestricted
+  ("jailbroken") modes are available in Settings for users who want them.
+- **Everything local.** Chats, messages, and sandboxes live on your disk
+  (SQLite + a per-chat working directory). Close the app, re-open it, your
+  conversations are still there.
+- **Resumable.** Each chat maps to a `claude --resume` session, so Claude
+  remembers the full history of a conversation across restarts.
 
-## Prereqs
+## Getting started
 
-* Node 20+
-* The `claude` CLI installed and on your `$PATH` (or set `CLAUDE_BIN`)
-* Build deps for `better-sqlite3` native rebuild:
-  * Linux: `build-essential` and `python3` (`sudo apt install build-essential python3`)
-  * macOS: Xcode Command Line Tools (`xcode-select --install`)
+### 1. Install the prerequisites
 
-## Run in dev
+- **Node.js 20 or newer** — <https://nodejs.org>
+- **Build tools** for the native SQLite module:
+  - Linux: `sudo apt install build-essential python3` (or your distro's
+    equivalent)
+  - macOS: `xcode-select --install`
+  - Windows: Visual Studio Build Tools with the "Desktop development with
+    C++" workload
+- **Bubblewrap** (Linux only, recommended) — enables the Default sandbox.
+  See the distro-specific commands in [INFO.md](./INFO.md#prereqs). The app
+  will tell you exactly which command to run if it's missing.
+
+You do **not** need to install the `claude` CLI ahead of time — the app
+will offer to install it for you on first launch.
+
+### 2. Install the app
 
 ```bash
-cd desktop
-npm install     # also compiles better-sqlite3 against Electron's ABI
-npm run dev     # starts Vite + Electron with HMR
+git clone <this-repo> claude-desktop
+cd claude-desktop
+npm install
 ```
 
-Vite serves the renderer at http://localhost:5173 with full HMR. Electron
-loads that URL and boots the backend HTTP server in-process. Dev tools open
-automatically in a detached window.
+`npm install` also compiles `better-sqlite3` against Electron's Node ABI.
+If it fails, re-run it with `--foreground-scripts` to see the native build
+log.
 
-Stopping with Ctrl-C kills Vite; closing the window triggers a clean
-backend shutdown via `before-quit`.
+### 3. Run it
 
-## Build a Linux AppImage
+**Dev mode** (hot-reload, devtools open):
 
 ```bash
-cd desktop
+npm run dev
+```
+
+**Build a standalone app:**
+
+```bash
 npm run pack
-# → desktop/release/Cowork-0.1.0.AppImage
-chmod +x release/Cowork-*.AppImage
-./release/Cowork-0.1.0.AppImage
+# Linux: ./release/Cowork-*.AppImage
+# macOS: ./release/Cowork-*.dmg
+# Windows: ./release/Cowork Setup *.exe
 ```
 
-`electron-builder` packages `dist/` (the built renderer) and `electron/`
-(the main process + in-process backend). `better-sqlite3` is rebuilt
-against Electron's embedded Node ABI by the `postinstall` hook.
+### 4. First launch
 
-> ⚠️ If you change native deps, re-run `npm install` in `desktop/`.
+1. **Install the CLI.** If `claude` isn't on your system, a modal pops up
+   offering to install it. It runs the official one-liner
+   (`curl -fsSL claude.ai/install.sh | bash`) and streams the log so you
+   can see what's happening. No sudo required.
+2. **Sign in.** A second modal explains the OAuth flow and opens a
+   terminal window running `claude auth login`. Follow the prompts; when
+   you're done, close the terminal and come back to the app.
+3. **Start a chat.** Click "New chat" (or "New cowork") in the left
+   sidebar. In Cowork mode, click the 📁 button in the chat header to
+   attach a folder.
+4. **Send a message.** That's it.
 
-## Configuration
+### 5. Choosing a sandbox mode
 
-Env vars you can set before launching (or bake into a launcher script):
+The default ("Sandboxed") mode is the right choice for most people. If
+you want something different, go to **Settings → Security**:
 
-| Var                | Meaning                                         | Default                   |
-|--------------------|-------------------------------------------------|---------------------------|
-| `CLAUDE_BIN`       | Absolute path to `claude` CLI                   | PATH lookup               |
-| `ALLOWED_TOOLS`    | Comma list passed to `--allowedTools`           | `Read,Write,Edit,Bash,Glob,Grep` |
-| `PERMISSION_MODE`  | `--permission-mode` value                       | `acceptEdits`             |
-| `UPLOAD_MAX_BYTES` | Per-file upload cap                             | 200 MB                    |
+| Mode | What it does | When to use |
+|------|---|---|
+| **Default (sandboxed)** | Runs Claude in a bubblewrap sandbox. Only the folders you attach are visible; the rest of `$HOME` is hidden. | Default. Recommended. |
+| **Docker shell** | Runs Claude inside a Docker container. Strong isolation; needs Docker running. | If you prefer container-based isolation or are on a distro where bubblewrap is awkward. |
+| **Jailbroken** | No sandbox, no permission prompts, full host access. | Throwaway VMs you control. **Not recommended for your daily machine.** |
 
-Per-user data lives at the OS user-data dir — SQLite DB and sandboxes both
-go there, so uninstalling doesn't clobber your chat history.
+## Common issues
 
-## Troubleshooting
-
-* **"Failed to launch claude CLI"** — the `claude` binary isn't on PATH.
-  Install it, or point `CLAUDE_BIN` at the absolute path.
-* **Uploads fail with 400 "invalid filename"** — the filename contained a
-  slash or `..`. The backend accepts basenames only.
-* **`better-sqlite3` import error after `npm install`** — run
-  `npx electron-builder install-app-deps` (also what `postinstall` does).
-* **Electron fails to install at runtime** — `node_modules/electron/dist/`
-  is missing, meaning the postinstall download never completed. Delete
-  `node_modules/electron` and run `npm install electron --foreground-scripts`
-  to see the real error.
-* **AppImage won't launch on Wayland** — try
+- **"Default mode cannot start: bubblewrap not installed"** — install
+  `bwrap` using the command for your distribution (shown in the error
+  dialog), or switch to Docker / Jailbroken in Settings.
+- **"Failed to launch claude CLI"** — the `claude` binary isn't on your
+  `$PATH`. Open Settings and use the Install button, or install it
+  manually and restart the app.
+- **AppImage won't launch on Wayland** — try
   `./Cowork-*.AppImage --no-sandbox` or set
   `ELECTRON_OZONE_PLATFORM_HINT=auto`.
 
-## Project layout
+More in [INFO.md](./INFO.md#troubleshooting).
 
-```
-desktop/
-├── electron/
-│   ├── main.cjs        ← app lifecycle, window, IPC
-│   ├── preload.cjs     ← contextBridge → renderer
-│   ├── backend.cjs     ← in-process HTTP server + claude CLI driver
-│   └── db.cjs          ← better-sqlite3 schema + API
-├── src/
-│   ├── App.jsx
-│   ├── main.jsx
-│   ├── components/
-│   │   ├── Sidebar.jsx
-│   │   ├── ChatView.jsx
-│   │   ├── Composer.jsx      ← drag/drop, paste, upload
-│   │   ├── MessageBubble.jsx
-│   │   ├── EventTimeline.jsx ← tool calls & file events
-│   │   ├── FilesPanel.jsx    ← right panel + previews
-│   │   └── StatusBar.jsx
-│   ├── hooks/
-│   │   └── useStreamChat.js  ← POST-body SSE consumer
-│   └── lib/
-│       └── api.js
-├── index.html
-├── vite.config.js
-├── tailwind.config.js
-├── postcss.config.js
-└── package.json              ← electron-builder config inline
-```
+## Learn more
 
-## Not done yet
+- [`INFO.md`](./INFO.md) — architecture, developer docs, configuration,
+  project layout, and a full troubleshooting reference.
+- The official Claude Code docs — <https://docs.claude.com/en/docs/claude-code>
 
-* In-app settings pane (tools allowlist, model, permission-mode).
-* Error retry / reconnect for the CLI on unexpected exit.
-* Tests. A smoke test that opens the window, creates a chat, sends "hi",
-  and asserts a stream was received would pay for itself quickly.
+## License & disclaimer
+
+This project is an unofficial community build. "Claude" is a trademark of
+Anthropic. The app is provided as-is with no warranty; review
+[INFO.md](./INFO.md) before using it on machines with sensitive data.

@@ -1,27 +1,30 @@
-import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import React, { useCallback, useEffect, useRef } from 'react';
 import MessageBubble from './MessageBubble.jsx';
 import Composer from './Composer.jsx';
-import { useStreamChat } from '../hooks/useStreamChat.js';
 
 function basenameOf(p) {
   if (!p) return '';
   return p.split('/').filter(Boolean).pop() || p;
 }
 
+// ChatView is a view-only component now. The whole turn lifecycle (SSE
+// stream, live draft, persistence) lives in App.jsx so it survives this
+// component being remounted when the user switches chats. We just render
+// the messages + whatever draft the parent hands us, and forward submits /
+// stops back up.
 export default function ChatView({
   chat,
   messages,
-  setMessages,
+  liveMessage,
+  isStreaming,
+  onSubmit,
+  onStop,
   onEnsureApiSession,
   onModelChange,
   onAddFolders,
   onRemoveFolder,
-  onSent,
-  onLiveFiles,
   backendReady,
 }) {
-  const { send, stop, isStreaming } = useStreamChat();
-  const [liveMessage, setLiveMessage] = useState(null); // streaming assistant draft
   const scrollRef = useRef(null);
   const endRef = useRef(null);
 
@@ -41,77 +44,8 @@ export default function ChatView({
 
   const handleSubmit = useCallback(async ({ prompt, userDisplay }) => {
     if (!chat) return;
-
-    const updated = await onEnsureApiSession(chat);
-    const apiSessionId = updated?.apiSessionId;
-    if (!apiSessionId) return;
-
-    // Optimistic user message (local id prefixed with 'tmp-')
-    const tempUser = {
-      id: 'tmp-u-' + Date.now(),
-      chatId: chat.id,
-      role: 'user',
-      content: userDisplay || prompt,
-      events: [],
-      files: [],
-      createdAt: Date.now(),
-    };
-    setMessages((m) => [...m, tempUser]);
-
-    // Start streaming assistant response
-    const draft = {
-      id: 'tmp-a-' + Date.now(),
-      chatId: chat.id,
-      role: 'assistant',
-      content: '',
-      events: [],
-      files: [],
-      createdAt: Date.now(),
-    };
-    setLiveMessage(draft);
-    onLiveFiles?.([]);
-
-    let accText = '';
-    const accEvents = [];
-    const accFiles = [];
-
-    const result = await send({
-      apiSessionId,
-      prompt,
-      model: chat.model || null,
-      onEvent: (evt) => {
-        accEvents.push(evt);
-        if (evt.event === 'assistant_text') {
-          accText += evt.data?.text ?? '';
-        } else if (evt.event === 'file_event') {
-          const d = evt.data || {};
-          if (d.kind === 'deleted') {
-            const i = accFiles.findIndex((f) => f.path === d.path);
-            if (i >= 0) accFiles.splice(i, 1);
-          } else {
-            const i = accFiles.findIndex((f) => f.path === d.path);
-            const entry = { path: d.path, url: d.url, kind: d.kind, at: Date.now() };
-            if (i >= 0) accFiles[i] = entry; else accFiles.push(entry);
-          }
-          onLiveFiles?.(accFiles.slice());
-        }
-        setLiveMessage({ ...draft, content: accText, events: accEvents.slice(), files: accFiles.slice() });
-      },
-    });
-
-    setLiveMessage(null);
-
-    await onSent({
-      chatId: chat.id,
-      userMessage: userDisplay || prompt,
-      assistantResult: {
-        text: result.text,
-        events: result.events,
-        files: result.files,
-        claudeSessionId: result.claudeSessionId,
-      },
-    });
-  }, [chat, onEnsureApiSession, send, setMessages, onSent, onLiveFiles]);
+    await onSubmit?.({ chat, prompt, userDisplay });
+  }, [chat, onSubmit]);
 
   const apiSessionId = chat?.apiSessionId || null;
 
@@ -205,7 +139,7 @@ export default function ChatView({
               disabled={!backendReady}
               apiSessionId={apiSessionId}
               isStreaming={isStreaming}
-              onStop={stop}
+              onStop={onStop}
               onEnsureSession={handleEnsureSession}
               model={chat.model || ''}
               onModelChange={onModelChange}

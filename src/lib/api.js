@@ -38,6 +38,10 @@ export async function createApiSession(opts = {}) {
   if (opts.disallowedTools) body.disallowedTools = opts.disallowedTools;
   if (opts.shellMode) body.shellMode = opts.shellMode;
   if (opts.dockerImage) body.dockerImage = opts.dockerImage;
+  // Optional stable key (typically the chat id). Lets the backend derive a
+  // stable ephemeral cwd so the CLI's session jsonl stays findable across
+  // restarts when the user hasn't attached a folder.
+  if (opts.clientRef) body.clientRef = opts.clientRef;
   const r = await fetch(`${base}/sessions`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
@@ -47,16 +51,6 @@ export async function createApiSession(opts = {}) {
     const text = await r.text().catch(() => '');
     throw new Error(`create session failed (${r.status}): ${text}`);
   }
-  return r.json();
-}
-
-// Local Claude CLI history — sessions previously run via the `claude` binary,
-// stored as JSONL in ~/.claude/projects/. Returns recent sessions with first
-// user-message preview as a stand-in for a title.
-export async function getClaudeHistory(limit = 50) {
-  const base = await resolveBaseUrl();
-  const r = await fetch(`${base}/claude-history?limit=${limit}`);
-  if (!r.ok) throw new Error(`/claude-history failed (${r.status})`);
   return r.json();
 }
 
@@ -211,6 +205,22 @@ export async function getDockerStatus() {
   const base = await resolveBaseUrl();
   const r = await fetch(`${base}/docker-status`);
   if (!r.ok) throw new Error(`/docker-status failed (${r.status})`);
+  return r.json();
+}
+
+// Check whether the host can run the Default-mode sandbox. On Linux this means
+// bubblewrap (`bwrap`) is on PATH. Shape:
+//   available: boolean
+//   platform:  'linux' | 'darwin' | 'win32' | ...
+//   tool:      'bwrap' | null
+//   reason?:   string (when available === false)
+//   installHints?: { [distroFamily: string]: installCommand }
+//   path?:     string (when available)
+//   version?:  string (when available)
+export async function getSandboxStatus() {
+  const base = await resolveBaseUrl();
+  const r = await fetch(`${base}/sandbox-status`);
+  if (!r.ok) throw new Error(`/sandbox-status failed (${r.status})`);
   return r.json();
 }
 
