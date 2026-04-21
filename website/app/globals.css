@@ -1,0 +1,81 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+/* ---- Base ---- */
+html, body {
+  background: #07070a;
+  color: #eaeaea;
+}
+
+::selection {
+  background: rgba(255, 106, 26, 0.35);
+  color: #fff;
+}
+
+/* ---- Animated scanline grid (techno backdrop) ---- */
+.bg-grid {
+  background-image:
+    linear-gradient(rgba(255, 106, 26, 0.055) 1px, transparent 1px),
+    linear-gradient(90deg, rgba(255, 106, 26, 0.055) 1px, transparent 1px);
+  background-size: 42px 42px;
+  animation: grid-scroll 12s linear infinite;
+}
+
+@keyframes grid-scroll {
+  0%   { background-position: 0 0; }
+  100% { background-position: 0 42px; }
+}
+
+/* Radial vignette so the grid fades at the edges */
+.vignette {
+  background: radial-gradient(ellipse at center,
+    transparent 0%,
+    transparent 40%,
+    rgba(7, 7, 10, 0.85) 100%);
+}
+
+/* ---- Glowing CTA button ---- */
+@keyframes ember-pulse {
+  0%, 100% { box-shadow: 0 0 28px rgba(255,106,26,0.40), 0 0 64px rgba(255,106,26,0.12); }
+  50%      { box-shadow: 0 0 44px rgba(255,106,26,0.68), 0 0 92px rgba(255,106,26,0.24); }
+}
+.ember-glow { animation: ember-pulse 3s ease-in-out infinite; }
+
+/* ---- Blink (for the alpha indicator + cursor) ---- */
+@keyframes blink { 0%, 100% { opacity: 1; } 50% { opacity: 0.15; } }
+.blink { animation: blink 1.2s step-end infinite; }
+
+/* ---- Subtle scanline overlay ---- */
+.scanlines::before {
+  content: '';
+  position: absolute;
+  inset: 0;
+  background: repeating-linear-gradient(
+    to bottom,
+    rgba(255,255,255,0.025) 0px,
+    rgba(255,255,255,0.025) 1px,
+    transparent 1px,
+    transparent 3px
+  );
+  pointer-events: none;
+  mix-blend-mode: overlay;
+}
+
+/* ---- Gradient text helper ---- */
+.text-ember-gradient {
+  background: linear-gradient(180deg, #ffb073 0%, #ff6a1a 55%, #c73906 100%);
+  -webkit-background-clip: text;
+          background-clip: text;
+  color: transparent;
+}
+
+/* ---- Bracket accents around section headings ---- */
+.bracketed::before { content: '['; color: #ff6a1a; margin-right: 0.5rem; }
+.bracketed::after  { content: ']'; color: #ff6a1a; margin-left: 0.5rem; }
+
+/* ---- Terminal prompt ---- */
+.prompt::before {
+  content: '$ ';
+  color: #ff6a1a;
+}
