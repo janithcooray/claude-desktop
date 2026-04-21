@@ -31,7 +31,14 @@ locally — no browser tab, no copy-paste, no cloud sync.
 
 ## Getting started
 
-### 1. Download
+### Method 1 - Download
+
+- Download — one direct link to (Download)[https://github.com/janithcooray/claude-desktop/releases/download/v0.1.0-alpha/Claude-Desktop-0.1.0.AppImage]
+- First launch — app handles CLI install + sign-in for you
+- Sandbox mode — Settings → Security
+
+### Method 2 - Build
+#### 1. Install the prerequisites
 
 **Linux (x86_64):**
 
@@ -39,21 +46,42 @@ locally — no browser tab, no copy-paste, no cloud sync.
 - 📖 [Read Me](https://github.com/janithcooray/claude-desktop#readme) — full project docs, sandbox modes, troubleshooting
 - 📝 [Release notes](https://github.com/janithcooray/claude-desktop/blob/main/RELEASE_NOTES.md) — what's in v0.1.0-alpha
 
-Double-click the AppImage to run. No install, no build tools, no terminal
-required — the app will install the `claude` CLI and walk you through
-sign-in on first launch.
+#### 2. Install the app
 
 > If double-click doesn't work, right-click the file → Properties →
 > Permissions → "Allow executing file as program", then open it again.
 
 ### 2. First launch
 
-1. **Install the CLI.** If `claude` isn't on your system, a modal offers
-   to install it automatically. Streamed log, no terminal needed.
-2. **Sign in.** A second modal opens a terminal running `claude auth login`.
-   Follow the prompts, then come back to the app.
-3. **Start a chat.** Click "New chat" or "New cowork" in the left sidebar.
-   In Cowork mode, click the folder button in the header to attach a folder.
+#### 3. Run it
+
+**Dev mode** (hot-reload, devtools open):
+
+```bash
+npm run dev
+```
+
+**Build a standalone app:**
+
+```bash
+npm run pack
+# Linux: ./release/Cowork-*.AppImage
+# macOS: ./release/Cowork-*.dmg
+# Windows: ./release/Cowork Setup *.exe
+```
+
+### First launch
+
+1. **Install the CLI.** If `claude` isn't on your system, a modal pops up
+   offering to install it. It runs the official one-liner
+   (`curl -fsSL claude.ai/install.sh | bash`) and streams the log so you
+   can see what's happening. No sudo required.
+2. **Sign in.** A second modal explains the OAuth flow and opens a
+   terminal window running `claude auth login`. Follow the prompts; when
+   you're done, close the terminal and come back to the app.
+3. **Start a chat.** Click "New chat" (or "New cowork") in the left
+   sidebar. In Cowork mode, click the 📁 button in the chat header to
+   attach a folder.
 4. **Send a message.** That's it.
 
 ### 3. Choosing a sandbox mode
