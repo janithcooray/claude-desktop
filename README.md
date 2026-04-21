@@ -31,66 +31,32 @@ locally — no browser tab, no copy-paste, no cloud sync.
 
 ## Getting started
 
-### 1. Install the prerequisites
+### 1. Download
 
-- **Node.js 20 or newer** — <https://nodejs.org>
-- **Build tools** for the native SQLite module:
-  - Linux: `sudo apt install build-essential python3` (or your distro's
-    equivalent)
-  - macOS: `xcode-select --install`
-  - Windows: Visual Studio Build Tools with the "Desktop development with
-    C++" workload
-- **Bubblewrap** (Linux only, recommended) — enables the Default sandbox.
-  See the distro-specific commands in [INFO.md](./INFO.md#prereqs). The app
-  will tell you exactly which command to run if it's missing.
+**Linux (x86_64):**
 
-You do **not** need to install the `claude` CLI ahead of time — the app
-will offer to install it for you on first launch.
+- ⬇ [Download AppImage](https://github.com/janithcooray/claude-desktop/releases/download/v0.1.0-alpha/Claude-Desktop-0.1.0.AppImage)
+- 📖 [Read Me](https://github.com/janithcooray/claude-desktop#readme) — full project docs, sandbox modes, troubleshooting
+- 📝 [Release notes](https://github.com/janithcooray/claude-desktop/blob/main/RELEASE_NOTES.md) — what's in v0.1.0-alpha
 
-### 2. Install the app
+Double-click the AppImage to run. No install, no build tools, no terminal
+required — the app will install the `claude` CLI and walk you through
+sign-in on first launch.
 
-```bash
-git clone <this-repo> claude-desktop
-cd claude-desktop
-npm install
-```
+> If double-click doesn't work, right-click the file → Properties →
+> Permissions → "Allow executing file as program", then open it again.
 
-`npm install` also compiles `better-sqlite3` against Electron's Node ABI.
-If it fails, re-run it with `--foreground-scripts` to see the native build
-log.
+### 2. First launch
 
-### 3. Run it
-
-**Dev mode** (hot-reload, devtools open):
-
-```bash
-npm run dev
-```
-
-**Build a standalone app:**
-
-```bash
-npm run pack
-# Linux: ./release/Cowork-*.AppImage
-# macOS: ./release/Cowork-*.dmg
-# Windows: ./release/Cowork Setup *.exe
-```
-
-### 4. First launch
-
-1. **Install the CLI.** If `claude` isn't on your system, a modal pops up
-   offering to install it. It runs the official one-liner
-   (`curl -fsSL claude.ai/install.sh | bash`) and streams the log so you
-   can see what's happening. No sudo required.
-2. **Sign in.** A second modal explains the OAuth flow and opens a
-   terminal window running `claude auth login`. Follow the prompts; when
-   you're done, close the terminal and come back to the app.
-3. **Start a chat.** Click "New chat" (or "New cowork") in the left
-   sidebar. In Cowork mode, click the 📁 button in the chat header to
-   attach a folder.
+1. **Install the CLI.** If `claude` isn't on your system, a modal offers
+   to install it automatically. Streamed log, no terminal needed.
+2. **Sign in.** A second modal opens a terminal running `claude auth login`.
+   Follow the prompts, then come back to the app.
+3. **Start a chat.** Click "New chat" or "New cowork" in the left sidebar.
+   In Cowork mode, click the folder button in the header to attach a folder.
 4. **Send a message.** That's it.
 
-### 5. Choosing a sandbox mode
+### 3. Choosing a sandbox mode
 
 The default ("Sandboxed") mode is the right choice for most people. If
 you want something different, go to **Settings → Security**:
@@ -110,10 +76,16 @@ you want something different, go to **Settings → Security**:
   `$PATH`. Open Settings and use the Install button, or install it
   manually and restart the app.
 - **AppImage won't launch on Wayland** — try
-  `./Cowork-*.AppImage --no-sandbox` or set
+  `./Claude-Desktop-0.1.0.AppImage --no-sandbox` or set
   `ELECTRON_OZONE_PLATFORM_HINT=auto`.
 
 More in [INFO.md](./INFO.md#troubleshooting).
+
+## Build from source
+
+If you want to run the dev build or package your own AppImage, see
+[INFO.md](./INFO.md) — it covers prerequisites, `npm run dev`,
+`npm run pack`, and the project layout.
 
 ## Learn more
 
