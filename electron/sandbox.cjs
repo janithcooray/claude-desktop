@@ -167,6 +167,26 @@ function wrapWithSandbox(claudeBin, claudeArgs, opts = {}) {
   const cwd = opts.cwd || null;
   const addDirs = Array.isArray(opts.addDirs) ? opts.addDirs : [];
 
+  // Resolve the symlink chain of the claude binary. The current CLI installer
+  // (claude.ai/install.sh) on Debian/Ubuntu/Fedora/Arch ships the binary as:
+  //
+  //   ~/.local/bin/claude  →  ~/.local/share/claude/versions/<version>
+  //
+  // We already expose binDir (~/.local/bin) below, but the SYMLINK TARGET
+  // lives elsewhere under $HOME — which our --tmpfs HOME step hides. Without
+  // resolving this, bwrap's execvp dies with:
+  //   bwrap: execvp /home/$USER/.local/bin/claude: No such file or directory
+  // even though the symlink itself is present in the sandbox. We capture the
+  // realpath here so we can bind-mount the target directory too.
+  let claudeRealBin = claudeBin;
+  try {
+    claudeRealBin = fs.realpathSync(claudeBin);
+  } catch {
+    // realpath can fail if the symlink is dangling on the host — leave
+    // claudeRealBin === claudeBin and let the spawn fail with its own error.
+  }
+  const realBinDir = path.dirname(claudeRealBin);
+
   // Build the bwrap argv. Order matters: later binds overlay earlier ones,
   // which is how we hide $HOME and then re-expose specific subdirs on top.
   const args = [
@@ -230,6 +250,17 @@ function wrapWithSandbox(claudeBin, claudeArgs, opts = {}) {
   // Some of these already fall under /usr or /opt (which we ro-bound above)
   // but binding the exact dir is harmless and covers home-relative installs.
   args.push('--ro-bind', binDir, binDir);
+
+  // If claudeBin is a symlink whose target lives outside binDir, expose the
+  // target's directory too. The canonical case is the claude.ai installer on
+  // Debian/Ubuntu/Fedora/Arch, which plants:
+  //   ~/.local/bin/claude  →  ~/.local/share/claude/versions/<ver>
+  // Our --tmpfs HOME hides ~/.local/share entirely, so the symlink resolves
+  // to nothing inside the sandbox. Re-binding the real dir fixes execvp
+  // without re-exposing the rest of ~/.local.
+  if (realBinDir !== binDir) {
+    args.push('--ro-bind-try', realBinDir, realBinDir);
+  }
 
   // User-attached working folders, read-write. The cwd and each addDir get
   // their own bind — if they live under $HOME they override the tmpfs; if
