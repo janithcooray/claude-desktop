@@ -9,13 +9,17 @@
 //   4. Handle native dialogs (file picker, save-as) and shell actions.
 //   5. Clean everything up on quit.
 
-const { app, BrowserWindow, ipcMain, shell, dialog } = require('electron');
+const { app, BrowserWindow, Notification, ipcMain, shell, dialog } = require('electron');
 const path = require('node:path');
 const fs = require('node:fs');
 
 const { startBackend } = require('./backend.cjs');
 const dbModule = require('./db.cjs');
 const prefs = require('./prefs.cjs');
+
+// Track the most recent notification per approval id so a duplicate signal
+// (broker hook + renderer IPC) doesn't fire two pop-ups for the same prompt.
+const recentApprovalNotices = new Map();
 
 const isDev = !app.isPackaged && process.env.NODE_ENV !== 'production';
 
@@ -128,6 +132,15 @@ function registerIpc() {
     return res.filePaths;
   });
 
+  // Renderer-side hint: the ApprovalModal calls this whenever it sees a new
+  // approval request. Same path as the broker hook below — both go through
+  // surfaceApproval() which dedupes on id. Belt-and-suspenders so a missed
+  // server-side hook still produces a desktop notification.
+  ipcMain.handle('approvals:notify', (_e, req) => {
+    surfaceApproval(req);
+    return true;
+  });
+
   ipcMain.handle('dialog:saveFileAs', async (_e, { url, suggestedName } = {}) => {
     if (!mainWindow || !url) return { ok: false };
     const res = await dialog.showSaveDialog(mainWindow, {
@@ -157,7 +170,16 @@ async function bootstrap() {
   fs.mkdirSync(sandboxRoot, { recursive: true });
 
   try {
-    backend = await startBackend({ app, sandboxRoot });
+    backend = await startBackend({
+      app,
+      sandboxRoot,
+      // Native DE surface for permission prompts. Fires when the broker
+      // (electron/approval.cjs) records a new pending request — i.e. the
+      // exact moment the Claude CLI hits a tool gate. We pop a system
+      // notification (libnotify on X11/Wayland/Hyprland via Electron) and
+      // bring the Cowork window forward so the in-app modal is visible.
+      onApprovalPending: (req) => surfaceApproval(req),
+    });
   } catch (err) {
     dialog.showErrorBox('Backend failed to start', String(err?.stack || err));
     app.quit();
@@ -167,6 +189,94 @@ async function bootstrap() {
   if (mainWindow) {
     mainWindow.webContents.send('backend:ready', { url: backend.url });
   }
+}
+
+// Render a permission request as a desktop-environment notification + bring
+// the Cowork window to the front. Idempotent on `req.id` — both the broker
+// hook and the renderer's preload IPC may call this for the same approval,
+// and we only want one notification per id.
+function surfaceApproval(req) {
+  if (!req || !req.id) return;
+
+  // Bring the window forward so the in-app modal is visible. We deliberately
+  // don't use focus() exclusively — on Wayland (and some X11 WMs) windows
+  // can't steal focus, but show()+restore() at least pulls them out of the
+  // tray / minimized state.
+  if (mainWindow) {
+    try {
+      if (mainWindow.isMinimized()) mainWindow.restore();
+      mainWindow.show();
+      mainWindow.focus();
+    } catch { /* window may be tearing down */ }
+  }
+
+  // Dedupe by id with a short TTL so a notification doesn't fire twice in a
+  // burst but still rearms if the same id (somehow) recurs later.
+  const last = recentApprovalNotices.get(req.id);
+  if (last && Date.now() - last < 30_000) return;
+  recentApprovalNotices.set(req.id, Date.now());
+  // Keep the map from growing unboundedly across long sessions.
+  if (recentApprovalNotices.size > 200) {
+    const cutoff = Date.now() - 5 * 60_000;
+    for (const [id, ts] of recentApprovalNotices) {
+      if (ts < cutoff) recentApprovalNotices.delete(id);
+    }
+  }
+
+  if (!Notification.isSupported()) return;
+
+  const title = describeTool(req.toolName);
+  const body = describeInput(req.toolName, req.input || {}, req.summary);
+
+  const n = new Notification({
+    title,
+    body,
+    // urgent so dunst/mako/notify-osd render it persistently rather than as
+    // a brief toast — the user might be in another workspace.
+    urgency: 'critical',
+    silent: false,
+  });
+  n.on('click', () => {
+    if (!mainWindow) return;
+    try {
+      if (mainWindow.isMinimized()) mainWindow.restore();
+      mainWindow.show();
+      mainWindow.focus();
+    } catch { /* */ }
+  });
+  try { n.show(); } catch { /* notification daemon offline — modal still works */ }
+}
+
+// Friendly name for the notification title.
+function describeTool(name) {
+  if (!name) return 'Cowork: tool approval needed';
+  if (name === 'Bash') return 'Cowork: shell command needs approval';
+  if (name === 'Write') return 'Cowork: file write needs approval';
+  if (name === 'Edit' || name === 'MultiEdit') return 'Cowork: file edit needs approval';
+  if (name.startsWith('mcp__')) {
+    const parts = name.split('__');
+    return `Cowork: ${parts[1] || 'MCP'} tool needs approval`;
+  }
+  return `Cowork: ${name} needs approval`;
+}
+
+// One-line preview of what's being asked. Truncated aggressively so the
+// notification daemon doesn't expand into a wall of text.
+function describeInput(toolName, input, summary) {
+  if (typeof summary === 'string' && summary.length) return summary.slice(0, 200);
+  if (toolName === 'Bash' && typeof input.command === 'string') {
+    return truncate(input.command, 200);
+  }
+  if ((toolName === 'Write' || toolName === 'Edit' || toolName === 'MultiEdit') && (input.file_path || input.path)) {
+    return String(input.file_path || input.path);
+  }
+  try { return truncate(JSON.stringify(input), 200); }
+  catch { return 'See Cowork to review and approve.'; }
+}
+
+function truncate(s, n) {
+  if (!s) return '';
+  return s.length <= n ? s : `${s.slice(0, n - 1)}…`;
 }
 
 app.on('window-all-closed', () => {

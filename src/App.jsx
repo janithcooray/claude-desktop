@@ -7,7 +7,8 @@ import SettingsModal from './components/SettingsModal.jsx';
 import DisclaimerModal from './components/DisclaimerModal.jsx';
 import SignInModal from './components/SignInModal.jsx';
 import InstallModal from './components/InstallModal.jsx';
-import { createApiSession, getBackendEnvInfo, getHealth, setBaseUrl, getAuthStatus } from './lib/api.js';
+import ApprovalModal from './components/ApprovalModal.jsx';
+import { createApiSession, getBackendEnvInfo, getHealth, setBaseUrl, getAuthStatus, registerChatRoots } from './lib/api.js';
 import { streamChat } from './hooks/useStreamChat.js';
 
 export default function App() {
@@ -220,6 +221,25 @@ export default function App() {
     () => chats.find((c) => c.id === activeChatId) || null,
     [chats, activeChatId]
   );
+
+  // Register the active chat's roots (cwd + addDirs) with the backend so the
+  // chat-keyed preview route (`/chats/:id/files/...`) can resolve files that
+  // live under user-attached folders — even before the user has sent a new
+  // message and spun up a live CLI session. Re-runs whenever the folders
+  // change (user attaches/removes a folder) or the user switches chats.
+  useEffect(() => {
+    if (!activeChat || !backendUrl) return;
+    registerChatRoots(activeChat.id, {
+      cwd: activeChat.sandboxPath || null,
+      addDirs: Array.isArray(activeChat.sandboxPaths) ? activeChat.sandboxPaths : [],
+    });
+  }, [
+    backendUrl,
+    activeChat?.id,
+    activeChat?.sandboxPath,
+    // Re-register if the addDirs list itself changes, not just the array identity.
+    (activeChat?.sandboxPaths || []).join('|'),
+  ]);
 
   const refreshChats = useCallback(async () => {
     const list = await window.cowork.db.listChats();
@@ -628,6 +648,12 @@ export default function App() {
             }
           }}
         />
+      )}
+      {/* Mounted last so the approval modal stacks on top of everything else
+          when a tool gate fires mid-turn. Disabled while the disclaimer is
+          still up so first-launch users aren't ambushed by overlapping modals. */}
+      {disclaimerOk === true && (
+        <ApprovalModal backendReady={!!backendUrl} />
       )}
     </div>
   );

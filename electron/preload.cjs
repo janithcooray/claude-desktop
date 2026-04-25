@@ -48,4 +48,12 @@ contextBridge.exposeInMainWorld('cowork', {
     ipcRenderer.on('backend:ready', handler);
     return () => ipcRenderer.removeListener('backend:ready', handler);
   },
+
+  // Approval-gate side-channel. The renderer's ApprovalModal also fires this
+  // on every new approval (in addition to the broker's own server-side hook)
+  // so the OS notification + window-focus path runs even before main has
+  // wired up its broker listener — defensive belt-and-suspenders.
+  approvals: {
+    notify: (req) => invoke('approvals:notify', req),
+  },
 });

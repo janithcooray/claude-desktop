@@ -1,15 +1,18 @@
 import React, { useEffect, useMemo, useState } from 'react';
-import { absolutizeFileUrl, fileUrl } from '../lib/api.js';
+import { absolutizeFileUrl, chatFileUrl, fileUrl } from '../lib/api.js';
 
 // Resolve a file's preview URL to an *absolute* backend URL.
 //
-// We always rebuild from `chat.apiSessionId + file.path` when we have a
-// current session — the persisted `file.url` on historical messages can
-// reference a session the backend no longer knows about (the in-memory
-// sessions map is wiped on every app restart, so any URL stored before that
-// restart points at a dead id and 404s). Fall back to the stored URL only
-// if we haven't booted a session for this chat yet.
+// Prefer the chat-keyed endpoint (`/chats/:chatId/files/:path`) — that URL
+// survives app restarts because the backend resolves it against a
+// deterministic per-chat cwd plus any live session's attached folders.
+// Session-keyed URLs stored on old messages reference in-memory session ids
+// that evaporate on restart, so those always 404 once the app has been
+// closed and reopened. Fall back to them only as a last resort.
 function resolveUrl(file, chat) {
+  if (chat?.id && file?.path) {
+    return chatFileUrl(chat.id, file.path);
+  }
   if (chat?.apiSessionId && file?.path) {
     return fileUrl(chat.apiSessionId, file.path);
   }

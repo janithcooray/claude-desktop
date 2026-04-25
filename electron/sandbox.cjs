@@ -38,6 +38,96 @@ const fs = require('node:fs');
 const path = require('node:path');
 const { execFileSync } = require('node:child_process');
 
+// Walk the full execution chain of a binary (symlinks, one hop at a time,
+// plus `#!` interpreters) and return the list of directories that must be
+// bind-mounted for the kernel to successfully execvp() it inside the
+// sandbox. Canonical failure modes this handles:
+//
+//   1. `claudeBin` is a *multi-hop* symlink, any intermediate step of which
+//      lives under `$HOME` (hidden by our --tmpfs on $HOME). Real example
+//      from the claude.ai installer combined with a distro-packaged shim:
+//         /usr/local/bin/claude
+//           → /home/$USER/.local/bin/claude
+//           → /home/$USER/.local/share/claude/versions/<ver>
+//      Binding only the final realpath's dir fails because the kernel
+//      resolves symlinks hop-by-hop and the MIDDLE hop is ENOENT in the
+//      sandbox.
+//   2. `claudeBin` is a shell/node script whose shebang points at an
+//      interpreter outside /usr/bin (e.g. `#!/home/$USER/.nvm/.../node`).
+//   3. An intermediate directory component (e.g. /usr/local on some distros)
+//      is itself a symlink to a path not otherwise exposed.
+//
+// Implementation: we use `lstat` + `readlink` so we can walk each symlink
+// one step at a time, rather than jumping to the end with `realpath`. Every
+// step's parent directory is added to the bind list, and scripts have their
+// shebang interpreter queued back through the same walk.
+function execChainDirs(binPath) {
+  const dirs = new Set();
+  const seen = new Set();
+  const queue = [binPath];
+
+  // Add JUST the immediate parent dir of a path (plus its realpath, in case
+  // an intermediate component of the parent is itself a symlink — e.g. some
+  // distros symlink /usr/local → elsewhere). We deliberately do NOT walk
+  // ancestors up to `/`: that would pull in broad dirs like `/home/nova`,
+  // which would OVERLAY the --tmpfs on $HOME and re-expose everything we
+  // tried to hide.
+  const addParent = (p) => {
+    const d = path.dirname(p);
+    if (!d || d === '/') return;
+    dirs.add(d);
+    try {
+      const real = fs.realpathSync(d);
+      if (real && real !== d) dirs.add(real);
+    } catch { /* missing / unreadable — whatever, we tried */ }
+  };
+
+  while (queue.length) {
+    const p = queue.shift();
+    if (!p || seen.has(p)) continue;
+    seen.add(p);
+
+    addParent(p);
+
+    // Walk the symlink chain explicitly, one hop at a time. Each hop's
+    // parent dir must be bound so the kernel can resolve it inside the
+    // sandbox — `realpath` alone would skip straight to the end and miss
+    // any middle hop that lives under the tmpfs'd HOME. Cap at 40 to match
+    // POSIX SYMLOOP_MAX and avoid pathological loops.
+    let cursor = p;
+    for (let i = 0; i < 40; i++) {
+      let lst;
+      try { lst = fs.lstatSync(cursor); } catch { break; }
+      if (!lst.isSymbolicLink()) break;
+      let link;
+      try { link = fs.readlinkSync(cursor); } catch { break; }
+      const next = path.isAbsolute(link) ? link : path.resolve(path.dirname(cursor), link);
+      if (seen.has(next)) break;
+      seen.add(next);
+      addParent(next);
+      cursor = next;
+    }
+
+    // `cursor` is now the final real file (or the last step we could stat).
+    // Shebang probe: if it starts with `#!`, queue the interpreter too.
+    try {
+      const fd = fs.openSync(cursor, 'r');
+      const buf = Buffer.alloc(256);
+      const n = fs.readSync(fd, buf, 0, 256, 0);
+      fs.closeSync(fd);
+      if (n >= 2 && buf[0] === 0x23 /* # */ && buf[1] === 0x21 /* ! */) {
+        const firstLine = buf.slice(2, n).toString('utf8').split('\n')[0].trim();
+        const interp = firstLine.split(/\s+/)[0];
+        if (interp && path.isAbsolute(interp) && !seen.has(interp)) {
+          queue.push(interp);
+        }
+      }
+    } catch { /* binary / unreadable — parent bind above already covers it */ }
+  }
+
+  return Array.from(dirs);
+}
+
 // Find an executable on $PATH without invoking a shell. Returns the full
 // path to the first hit, or null.
 function onPath(prog) {
@@ -166,26 +256,23 @@ function wrapWithSandbox(claudeBin, claudeArgs, opts = {}) {
   const binDir = path.dirname(claudeBin);
   const cwd = opts.cwd || null;
   const addDirs = Array.isArray(opts.addDirs) ? opts.addDirs : [];
+  // Caller-provided directories that need to be visible read-only inside the
+  // sandbox (e.g. the dir holding our approval MCP shim — backend.cjs binds
+  // it so the CLI can spawn `node <APPROVAL_MCP_PATH>` from within bwrap).
+  // Each path is bind-mounted at the same location it has on the host so
+  // absolute paths in --mcp-config work without translation.
+  const extraReadOnlyDirs = Array.isArray(opts.extraReadOnlyDirs)
+    ? opts.extraReadOnlyDirs
+    : [];
 
-  // Resolve the symlink chain of the claude binary. The current CLI installer
-  // (claude.ai/install.sh) on Debian/Ubuntu/Fedora/Arch ships the binary as:
-  //
-  //   ~/.local/bin/claude  →  ~/.local/share/claude/versions/<version>
-  //
-  // We already expose binDir (~/.local/bin) below, but the SYMLINK TARGET
-  // lives elsewhere under $HOME — which our --tmpfs HOME step hides. Without
-  // resolving this, bwrap's execvp dies with:
-  //   bwrap: execvp /home/$USER/.local/bin/claude: No such file or directory
-  // even though the symlink itself is present in the sandbox. We capture the
-  // realpath here so we can bind-mount the target directory too.
-  let claudeRealBin = claudeBin;
-  try {
-    claudeRealBin = fs.realpathSync(claudeBin);
-  } catch {
-    // realpath can fail if the symlink is dangling on the host — leave
-    // claudeRealBin === claudeBin and let the spawn fail with its own error.
-  }
-  const realBinDir = path.dirname(claudeRealBin);
+  // Resolve every directory the kernel needs to exec `claudeBin` — the
+  // symlink target's dir, the shebang interpreter's dir, and any intermediate
+  // component that's itself a symlink. See `execChainDirs` above for the full
+  // rationale; the short version is that every observed variant of the "bwrap:
+  // execvp <path>: No such file or directory" error has been a missing link
+  // in that chain, and the old narrow fix (symlink target only) wasn't
+  // catching the shebang / intermediate-symlink cases.
+  const chainDirs = execChainDirs(claudeBin);
 
   // Build the bwrap argv. Order matters: later binds overlay earlier ones,
   // which is how we hide $HOME and then re-expose specific subdirs on top.
@@ -232,6 +319,32 @@ function wrapWithSandbox(claudeBin, claudeArgs, opts = {}) {
     '--tmpfs', '/var/tmp',
   ];
 
+  // DNS: on modern Linux (systemd-resolved, NetworkManager, resolvconf),
+  // /etc/resolv.conf is a symlink into /run — which our --tmpfs /run just
+  // hid. Inside the sandbox, DNS resolution then fails, and the CLI bubbles
+  // that up as "Unable to connect to API (ConnectionRefused)" because its
+  // HTTPS stack can't resolve api.anthropic.com.
+  //
+  // Fix: resolve the symlink on the host and bind the target directory
+  // read-only on top of the /run tmpfs. We deliberately do NOT also bind
+  // /etc/resolv.conf directly: the `--ro-bind /etc /etc` above already
+  // exposes the symlink, and adding a second bind on top of ro-bound /etc
+  // trips bwrap with "Can't create file at /etc/resolv.conf: No such file
+  // or directory" on distros where the symlink can't be replaced.
+  try {
+    const resolvTarget = fs.realpathSync('/etc/resolv.conf');
+    if (resolvTarget && resolvTarget !== '/etc/resolv.conf') {
+      const resolvDir = path.dirname(resolvTarget);
+      args.push('--ro-bind-try', resolvDir, resolvDir);
+    }
+  } catch { /* no /etc/resolv.conf or dangling — let the CLI surface it */ }
+
+  // Certificate trust stores: covered by our --ro-bind /etc bind above
+  // (/etc/ssl, /etc/pki, /etc/ca-certificates/...) but some distros put the
+  // actual cert blobs under /usr/share (NixOS) or /var/lib/ca-certificates
+  // (openSUSE). /usr is already bound; /var/lib/ca-certificates isn't.
+  args.push('--ro-bind-try', '/var/lib/ca-certificates', '/var/lib/ca-certificates');
+
   // Hide the rest of $HOME behind a tmpfs, then selectively re-expose the
   // directories Claude actually needs. Dotfiles (.ssh, .gnupg, .aws, browser
   // profiles, …) disappear from the sandbox's view.
@@ -245,22 +358,44 @@ function wrapWithSandbox(claudeBin, claudeArgs, opts = {}) {
     args.push('--bind-try', claudeHome, claudeHome);
   }
 
-  // The claude binary's directory, read-only. Covers installs under
-  // ~/.local/bin, /usr/local/bin, /opt/claude/bin, /nix/store/..., etc.
-  // Some of these already fall under /usr or /opt (which we ro-bound above)
-  // but binding the exact dir is harmless and covers home-relative installs.
-  args.push('--ro-bind', binDir, binDir);
-
-  // If claudeBin is a symlink whose target lives outside binDir, expose the
-  // target's directory too. The canonical case is the claude.ai installer on
-  // Debian/Ubuntu/Fedora/Arch, which plants:
-  //   ~/.local/bin/claude  →  ~/.local/share/claude/versions/<ver>
-  // Our --tmpfs HOME hides ~/.local/share entirely, so the symlink resolves
-  // to nothing inside the sandbox. Re-binding the real dir fixes execvp
-  // without re-exposing the rest of ~/.local.
-  if (realBinDir !== binDir) {
-    args.push('--ro-bind-try', realBinDir, realBinDir);
+  // `~/.claude.json` lives *beside* `~/.claude/`, not inside it. It stores
+  // the CLI's top-level settings (theme, defaults, feature flags) and the
+  // tool auto-writes it on first run. Without this bind the CLI crashes
+  // inside the sandbox with "Claude configuration file not found at:
+  // /home/<user>/.claude.json" because our --tmpfs HOME hid it.
+  //
+  // Defensive: `--bind-try` silently skips if the source is missing, and the
+  // CLI would still crash because a tmpfs-write on first run evaporates when
+  // the sandbox exits — so create an empty file on the host if absent, and
+  // the CLI can then populate it persistently on the next write.
+  if (home) {
+    const claudeJson = path.join(home, '.claude.json');
+    try {
+      if (!fs.existsSync(claudeJson)) fs.writeFileSync(claudeJson, '{}\n', { flag: 'wx' });
+    } catch { /* race / perms — fall through, worst case --bind-try skips */ }
+    args.push('--bind-try', claudeJson, claudeJson);
   }
+
+  // Bind every directory the exec chain touches. `--ro-bind-try` silently
+  // skips anything already covered by an earlier bind (e.g. dirs under /usr)
+  // or that doesn't exist on this host. Using -try keeps this forgiving
+  // across distro layouts — NixOS stores, Homebrew cellars, Nix-on-*,
+  // Gentoo stowed trees, and hermetic installers all land here.
+  const chainSet = new Set(chainDirs);
+  chainSet.add(binDir); // always expose the original binary's dir verbatim
+  for (const d of chainSet) {
+    if (!d) continue;
+    args.push('--ro-bind-try', d, d);
+  }
+
+  // One-line diagnostic: which dirs did the exec-chain walk decide to bind?
+  // Prints on every spawn so a user hitting "bwrap: execvp ... No such file"
+  // can immediately see whether a needed hop is missing. If this line is
+  // absent from stderr, the sandbox.cjs changes aren't loaded — restart the
+  // Electron main process (Ctrl+C `npm run dev`, then rerun).
+  process.stderr.write(
+    `[sandbox] claudeBin=${JSON.stringify(claudeBin)} chainDirs=${JSON.stringify([...chainSet])}\n`,
+  );
 
   // User-attached working folders, read-write. The cwd and each addDir get
   // their own bind — if they live under $HOME they override the tmpfs; if
@@ -271,6 +406,16 @@ function wrapWithSandbox(claudeBin, claudeArgs, opts = {}) {
   for (const d of addDirs) if (d) exposed.add(d);
   for (const p of exposed) {
     args.push('--bind-try', p, p);
+  }
+
+  // Caller-provided read-only directories. These are framework-internal —
+  // currently just the dir holding electron/approval-mcp.cjs so the CLI can
+  // spawn the shim — and must not overlap with user-writable paths. We
+  // dedupe against the rw set so a user who happened to pick the Electron
+  // resources dir as their working folder doesn't get it silently demoted.
+  for (const p of extraReadOnlyDirs) {
+    if (!p || exposed.has(p)) continue;
+    args.push('--ro-bind-try', p, p);
   }
 
   // Environment. bwrap clears the child's env unless we pass it through,

@@ -6,6 +6,15 @@ import {
   openClaudeConfigTerminal,
   getDockerStatus,
   getSandboxStatus,
+  getMcpRegistryServers,
+  getCuratedMcpServers,
+  getInstalledMcpServers,
+  installCuratedMcpServer,
+  uninstallMcpServer,
+  listPlugins,
+  updatePluginSettings,
+  startPlugin,
+  stopPlugin,
 } from '../lib/api.js';
 
 // Two-pane settings modal with a left nav. Sections grow as we wire up more
@@ -15,6 +24,8 @@ const SECTIONS = [
   { id: 'general',     label: 'General' },
   { id: 'account',     label: 'Account' },
   { id: 'claude-code', label: 'Claude Code' },
+  { id: 'mcp-servers', label: 'MCP Servers' },
+  { id: 'plugins',     label: 'Plugins' },
   { id: 'security',    label: 'Security' },
 ];
 
@@ -125,6 +136,8 @@ export default function SettingsModal({ onClose, onRequestSignIn }) {
             )}
             {section === 'account' && <AccountSection onRequestSignIn={onRequestSignIn} />}
             {section === 'claude-code' && <ClaudeCodeSection />}
+            {section === 'mcp-servers' && <McpServersSection />}
+            {section === 'plugins' && <PluginsSection />}
             {section === 'security' && <SecuritySection />}
           </div>
         </div>
@@ -522,6 +535,710 @@ function ClaudeCodeSection() {
           <div className="mt-2 text-[11px] text-accent-500 break-all">{configErr}</div>
         )}
       </Card>
+    </div>
+  );
+}
+
+// --- MCP Servers ---------------------------------------------------------
+//
+// Three views share this section:
+//
+//   view='installed'  — the user's configured servers (empty for now until we
+//                       wire the CLI config file). Shows an "Add more" CTA.
+//   view='picker'     — browses the official MCP registry
+//                       (https://modelcontextprotocol.io/registry/about). The
+//                       registry is only fetched when the user enters this
+//                       view — it's a few hundred entries and wasn't worth
+//                       paying for on every Settings open.
+//   view='detail'     — full card for a single server from the picker: title,
+//                       canonical name, description, repo + website links,
+//                       remotes, packages, required env vars.
+//
+// Install/enable flows are still TODO — the buttons on the detail view are
+// placeholders. The registry is read-only from our side.
+
+function McpServersSection() {
+  // view: 'installed' | 'curated-picker' | 'curated-detail' | 'registry-picker' | 'registry-detail'
+  const [view, setView] = useState('installed');
+  const [selected, setSelected] = useState(null);
+  // Bumped on each install/uninstall so the installed list refetches.
+  const [installedTick, setInstalledTick] = useState(0);
+
+  if (view === 'curated-detail' && selected) {
+    return (
+      <McpCuratedDetail
+        server={selected}
+        onBack={() => { setSelected(null); setView('curated-picker'); }}
+        onInstalled={() => {
+          setSelected(null);
+          setInstalledTick((t) => t + 1);
+          setView('installed');
+        }}
+      />
+    );
+  }
+
+  if (view === 'registry-detail' && selected) {
+    return (
+      <McpRegistryDetail
+        server={selected}
+        onBack={() => { setSelected(null); setView('registry-picker'); }}
+      />
+    );
+  }
+
+  if (view === 'curated-picker') {
+    return (
+      <McpCuratedPicker
+        onBack={() => setView('installed')}
+        onPick={(s) => { setSelected(s); setView('curated-detail'); }}
+        onBrowseRegistry={() => setView('registry-picker')}
+      />
+    );
+  }
+
+  if (view === 'registry-picker') {
+    return (
+      <McpRegistryPicker
+        onBack={() => setView('curated-picker')}
+        onPick={(s) => { setSelected(s); setView('registry-detail'); }}
+      />
+    );
+  }
+
+  return (
+    <McpInstalledList
+      refreshKey={installedTick}
+      onAddMore={() => setView('curated-picker')}
+      onChanged={() => setInstalledTick((t) => t + 1)}
+    />
+  );
+}
+
+// Installed view. Pulls the live set from ~/.claude.json via /mcp-installed.
+function McpInstalledList({ refreshKey, onAddMore, onChanged }) {
+  const [state, setState] = useState({ loading: true, error: null, servers: [] });
+
+  const load = async () => {
+    setState((s) => ({ ...s, loading: true, error: null }));
+    try {
+      const out = await getInstalledMcpServers();
+      setState({ loading: false, error: null, servers: out.servers || [] });
+    } catch (e) {
+      setState({ loading: false, error: String(e?.message || e), servers: [] });
+    }
+  };
+
+  useEffect(() => { load(); }, [refreshKey]);
+
+  const onRemove = async (id) => {
+    if (!window.confirm(`Remove MCP server "${id}"? The Claude CLI will stop connecting to it on the next turn.`)) return;
+    try {
+      await uninstallMcpServer(id);
+      onChanged?.();
+    } catch (e) {
+      window.alert(String(e?.message || e));
+    }
+  };
+
+  return (
+    <div className="space-y-4">
+      <Card
+        title="Installed MCP servers"
+        subtitle="Active entries from ~/.claude.json. The Claude CLI picks them up automatically on the next chat turn."
+      >
+        {state.loading && state.servers.length === 0 && (
+          <div className="text-center text-xs text-ink-500 py-4">Loading…</div>
+        )}
+        {state.error && (
+          <div className="text-xs text-accent-500">{state.error}</div>
+        )}
+        {!state.loading && !state.error && state.servers.length === 0 && (
+          <div className="py-6 text-center">
+            <div className="text-sm text-ink-300">No MCP servers installed.</div>
+            <div className="text-[11.5px] text-ink-500 mt-1">
+              Browse Cowork's catalog to add one.
+            </div>
+          </div>
+        )}
+        <div className="space-y-2">
+          {state.servers.map((s) => (
+            <InstalledMcpRow key={s.id} server={s} onRemove={() => onRemove(s.id)} />
+          ))}
+        </div>
+      </Card>
+      <div className="flex justify-end">
+        <button
+          type="button"
+          onClick={onAddMore}
+          className="text-xs font-medium px-3 py-1.5 rounded bg-accent-500 text-ink-50 hover:bg-accent-600"
+        >
+          + Add more
+        </button>
+      </div>
+    </div>
+  );
+}
+
+function InstalledMcpRow({ server, onRemove }) {
+  return (
+    <div className="flex items-start gap-3 rounded-lg border border-ink-700/60 bg-ink-900/30 px-3 py-2.5">
+      <McpServerIcon server={{ iconUrl: server.iconUrl, title: server.name, name: server.id }} />
+      <div className="flex-1 min-w-0">
+        <div className="flex items-baseline gap-2 flex-wrap">
+          <div className="text-sm font-medium text-ink-100 truncate">{server.name}</div>
+          <div className="text-[11px] text-ink-500 font-mono truncate">{server.id}</div>
+          <Pill tone={server.transport === 'http' ? 'ok' : undefined}>{server.transport}</Pill>
+          {!server.curated && <Pill tone="warn">unmanaged</Pill>}
+        </div>
+        {server.description && (
+          <div className="text-[12px] text-ink-300 mt-1 line-clamp-2">{server.description}</div>
+        )}
+        {server.url && (
+          <div className="text-[10.5px] text-ink-500 font-mono mt-1 break-all">{server.url}</div>
+        )}
+        {server.command && (
+          <div className="text-[10.5px] text-ink-500 font-mono mt-1 break-all">$ {server.command}</div>
+        )}
+      </div>
+      <button
+        type="button"
+        onClick={onRemove}
+        className="shrink-0 self-start text-[11px] text-ink-400 hover:text-accent-500 px-2 py-1 rounded hover:bg-ink-800"
+        title="Remove from ~/.claude.json"
+      >
+        Remove
+      </button>
+    </div>
+  );
+}
+
+// Cowork-curated picker. This is the primary "Add more" landing. It shows
+// only the servers we've vetted and know how to install end-to-end (auth
+// flow + config write-through); users looking for something we don't curate
+// yet can drop into the full public registry via the footer link.
+function McpCuratedPicker({ onBack, onPick, onBrowseRegistry }) {
+  const [state, setState] = useState({ loading: true, error: null, servers: [] });
+
+  useEffect(() => {
+    (async () => {
+      try {
+        const out = await getCuratedMcpServers();
+        setState({ loading: false, error: null, servers: out.servers || [] });
+      } catch (e) {
+        setState({ loading: false, error: String(e?.message || e), servers: [] });
+      }
+    })();
+  }, []);
+
+  return (
+    <div className="space-y-4">
+      <div className="flex items-center gap-2">
+        <button
+          type="button"
+          onClick={onBack}
+          className="text-xs text-ink-300 hover:text-ink-100 px-2 py-1 rounded hover:bg-ink-800"
+        >
+          ← Back
+        </button>
+        <div className="text-ink-100 text-sm font-medium">Add MCP server</div>
+      </div>
+
+      <Card
+        title="Cowork catalog"
+        subtitle="Curated, installable servers. Tap one to review, add credentials if needed, and install."
+      >
+        {state.loading && (
+          <div className="text-center text-xs text-ink-500 py-4">Loading…</div>
+        )}
+        {state.error && (
+          <div className="text-xs text-accent-500">{state.error}</div>
+        )}
+        {!state.loading && !state.error && state.servers.length === 0 && (
+          <div className="text-center text-xs text-ink-500 py-4">
+            No curated servers yet.
+          </div>
+        )}
+      </Card>
+
+      <div className="space-y-2">
+        {state.servers.map((s) => (
+          <McpServerRow
+            key={s.id}
+            server={{
+              ...s,
+              title: s.name,
+              name: s.registryName || s.id,
+            }}
+            onClick={() => onPick(s)}
+          />
+        ))}
+      </div>
+
+      <div className="pt-2 border-t border-ink-700/40 text-[11.5px] text-ink-500">
+        Looking for something else?{' '}
+        <button
+          type="button"
+          onClick={onBrowseRegistry}
+          className="text-accent-500 hover:text-accent-600 underline underline-offset-2"
+        >
+          Browse the full MCP registry
+        </button>
+        {' '}(500+ servers, discovery-only — installation via this app is Cowork-catalog only).
+      </div>
+    </div>
+  );
+}
+
+// Detail view + install form for a curated server. Collects `params` (args)
+// and `env` (secrets) declared on the catalog entry, then hits the backend
+// install route. Success bounces back to the installed list.
+function McpCuratedDetail({ server, onBack, onInstalled }) {
+  const [paramVals, setParamVals] = useState(() => {
+    const o = {};
+    for (const p of (server.params || [])) o[p.key] = '';
+    return o;
+  });
+  const [envVals, setEnvVals] = useState(() => {
+    const o = {};
+    for (const e of (server.env || [])) o[e.key] = '';
+    return o;
+  });
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState(null);
+
+  const missingRequired =
+    (server.params || []).some((p) => p.required && !paramVals[p.key]?.trim()) ||
+    (server.env || []).some((e) => e.required && !envVals[e.key]?.trim());
+
+  const doInstall = async () => {
+    setBusy(true);
+    setError(null);
+    try {
+      await installCuratedMcpServer({
+        id: server.id,
+        params: paramVals,
+        env: envVals,
+      });
+      onInstalled?.();
+    } catch (e) {
+      setError(String(e?.message || e));
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  return (
+    <div className="space-y-4">
+      <div className="flex items-center gap-2">
+        <button
+          type="button"
+          onClick={onBack}
+          className="text-xs text-ink-300 hover:text-ink-100 px-2 py-1 rounded hover:bg-ink-800"
+        >
+          ← Back
+        </button>
+        <div className="text-ink-100 text-sm font-medium truncate">{server.name}</div>
+      </div>
+
+      <Card title="Overview">
+        <div className="flex items-start gap-3">
+          <McpServerIcon server={{ ...server, title: server.name, name: server.registryName || server.id }} large />
+          <div className="flex-1 min-w-0">
+            <div className="text-base font-semibold text-ink-50 break-words">{server.name}</div>
+            {server.registryName && (
+              <div className="text-[11px] text-ink-500 font-mono break-all mt-0.5">{server.registryName}</div>
+            )}
+            <div className="flex items-center gap-2 mt-2 flex-wrap">
+              <Pill tone="ok">curated</Pill>
+              <Pill>{server.spec?.type || 'stdio'}</Pill>
+            </div>
+          </div>
+        </div>
+        <div className="text-[13px] text-ink-200 leading-relaxed whitespace-pre-wrap pt-2">
+          {server.description}
+        </div>
+        {server.homepage && (
+          <div className="pt-2 text-[11.5px]">
+            <a
+              href={server.homepage}
+              target="_blank"
+              rel="noreferrer"
+              className="text-accent-500 hover:text-accent-600 underline underline-offset-2"
+            >
+              Homepage ↗
+            </a>
+          </div>
+        )}
+      </Card>
+
+      {(server.params?.length > 0) && (
+        <Card title="Parameters" subtitle="Runtime values baked into the server's launch args.">
+          <div className="space-y-3">
+            {server.params.map((p) => (
+              <Field
+                key={p.key}
+                label={<>{p.label || p.key} {p.required && <span className="text-accent-500">*</span>}</>}
+                hint={p.description}
+              >
+                <input
+                  type="text"
+                  value={paramVals[p.key] || ''}
+                  onChange={(e) => setParamVals((v) => ({ ...v, [p.key]: e.target.value }))}
+                  placeholder={p.placeholder || ''}
+                  className="w-full bg-ink-900 border border-ink-700/60 rounded px-2.5 py-1.5 text-xs text-ink-100 placeholder-ink-500 focus:outline-none focus:border-accent-500/60"
+                />
+              </Field>
+            ))}
+          </div>
+        </Card>
+      )}
+
+      {(server.env?.length > 0) && (
+        <Card title="Credentials" subtitle="Stored in ~/.claude.json (mode 0600) and passed to the server subprocess as env vars. Never leaves your machine.">
+          <div className="space-y-3">
+            {server.env.map((e) => (
+              <Field
+                key={e.key}
+                label={<>{e.label || e.key} {e.required && <span className="text-accent-500">*</span>}</>}
+                hint={
+                  <>
+                    {e.description}
+                    {e.helpUrl && (
+                      <>
+                        {' '}
+                        <a
+                          href={e.helpUrl}
+                          target="_blank"
+                          rel="noreferrer"
+                          className="text-accent-500 hover:text-accent-600 underline underline-offset-2"
+                        >
+                          Get one ↗
+                        </a>
+                      </>
+                    )}
+                  </>
+                }
+              >
+                <input
+                  type={e.type === 'secret' || e.isSecret ? 'password' : 'text'}
+                  value={envVals[e.key] || ''}
+                  onChange={(ev) => setEnvVals((v) => ({ ...v, [e.key]: ev.target.value }))}
+                  autoComplete="off"
+                  spellCheck={false}
+                  className="w-full bg-ink-900 border border-ink-700/60 rounded px-2.5 py-1.5 text-xs text-ink-100 font-mono placeholder-ink-500 focus:outline-none focus:border-accent-500/60"
+                />
+              </Field>
+            ))}
+          </div>
+        </Card>
+      )}
+
+      {error && (
+        <div className="rounded border border-accent-500/40 bg-accent-500/10 text-accent-500 text-[11.5px] px-3 py-2">
+          {error}
+        </div>
+      )}
+
+      <div className="flex justify-end gap-2">
+        <button
+          type="button"
+          onClick={onBack}
+          disabled={busy}
+          className="text-xs text-ink-300 hover:text-ink-100 disabled:opacity-50 px-3 py-1.5 rounded border border-ink-700/60 hover:bg-ink-800"
+        >
+          Cancel
+        </button>
+        <button
+          type="button"
+          onClick={doInstall}
+          disabled={busy || missingRequired}
+          className="text-xs font-medium px-3 py-1.5 rounded bg-accent-500 text-ink-50 hover:bg-accent-600 disabled:opacity-50 disabled:cursor-not-allowed"
+        >
+          {busy ? 'Installing…' : 'Install'}
+        </button>
+      </div>
+    </div>
+  );
+}
+
+// Registry (full public catalog) browser. Discovery-only — installation
+// from here is not supported yet (users can copy the name into `claude mcp
+// add` manually). Same shape as the curated picker, with an info banner.
+function McpRegistryPicker({ onBack, onPick }) {
+  const [state, setState] = useState({ loading: true, error: null, servers: [], cachedAt: 0 });
+  const [query, setQuery] = useState('');
+
+  const load = async ({ refresh = false } = {}) => {
+    setState((s) => ({ ...s, loading: true, error: null }));
+    try {
+      const out = await getMcpRegistryServers({ refresh });
+      setState({ loading: false, error: null, servers: out.servers || [], cachedAt: out.cachedAt || 0 });
+    } catch (e) {
+      setState({ loading: false, error: String(e?.message || e), servers: [], cachedAt: 0 });
+    }
+  };
+
+  useEffect(() => { load(); }, []);
+
+  const q = query.trim().toLowerCase();
+  const filtered = q
+    ? state.servers.filter((s) =>
+        (s.title || '').toLowerCase().includes(q) ||
+        s.name.toLowerCase().includes(q) ||
+        (s.description || '').toLowerCase().includes(q))
+    : state.servers;
+
+  return (
+    <div className="space-y-4">
+      <div className="flex items-center gap-2">
+        <button
+          type="button"
+          onClick={onBack}
+          className="text-xs text-ink-300 hover:text-ink-100 px-2 py-1 rounded hover:bg-ink-800"
+        >
+          ← Back
+        </button>
+        <div className="text-ink-100 text-sm font-medium">Add MCP server</div>
+        <div className="flex-1" />
+        <button
+          type="button"
+          onClick={() => load({ refresh: true })}
+          disabled={state.loading}
+          className="text-xs text-ink-400 hover:text-ink-100 disabled:opacity-50 px-2 py-1 rounded hover:bg-ink-800"
+        >
+          {state.loading ? 'Refreshing…' : 'Refresh'}
+        </button>
+      </div>
+
+      <Card
+        title="Model Context Protocol registry"
+        subtitle="Pick a server to view its details. Install flow coming soon."
+      >
+        <input
+          type="search"
+          value={query}
+          onChange={(e) => setQuery(e.target.value)}
+          placeholder="Search by name, title, or description…"
+          className="w-full bg-ink-900 border border-ink-700/60 rounded px-2.5 py-1.5 text-xs text-ink-100 placeholder-ink-500 focus:outline-none focus:border-accent-500/60"
+        />
+        <div className="text-[11px] text-ink-500">
+          {state.loading && state.servers.length === 0 && 'Loading registry…'}
+          {!state.loading && !state.error && (
+            <>Showing {filtered.length} of {state.servers.length} server{state.servers.length === 1 ? '' : 's'}.</>
+          )}
+          {state.error && <span className="text-accent-500">{state.error}</span>}
+        </div>
+      </Card>
+
+      <div className="space-y-2">
+        {filtered.map((s) => (
+          <McpServerRow
+            key={s.name + ':' + (s.version || '')}
+            server={s}
+            onClick={() => onPick(s)}
+          />
+        ))}
+        {!state.loading && filtered.length === 0 && !state.error && (
+          <div className="text-center text-xs text-ink-500 py-8">
+            {q ? 'No servers match your search.' : 'The registry returned no servers.'}
+          </div>
+        )}
+      </div>
+    </div>
+  );
+}
+
+function McpServerRow({ server, onClick }) {
+  const label = server.title || server.name;
+  const clickable = typeof onClick === 'function';
+  return (
+    <button
+      type="button"
+      onClick={onClick}
+      disabled={!clickable}
+      className={`w-full text-left flex items-start gap-3 rounded-lg border border-ink-700/60 bg-ink-800/30 px-3 py-3 transition-colors ${clickable ? 'hover:bg-ink-800/60 hover:border-ink-600/60 cursor-pointer' : 'cursor-default'}`}
+    >
+      <McpServerIcon server={server} />
+      <div className="flex-1 min-w-0">
+        <div className="flex items-baseline gap-2 flex-wrap">
+          <div className="text-sm font-medium text-ink-100 truncate">{label}</div>
+          {server.title && server.name !== server.title && (
+            <div className="text-[11px] text-ink-500 font-mono truncate">{server.name}</div>
+          )}
+          {server.version && (
+            <div className="text-[10.5px] text-ink-500 font-mono shrink-0">v{server.version}</div>
+          )}
+        </div>
+        <div className="text-[12px] text-ink-300 mt-1 line-clamp-2">
+          {server.description || <span className="italic text-ink-500">No description provided.</span>}
+        </div>
+      </div>
+      {clickable && <div className="shrink-0 self-center text-ink-500 text-lg leading-none">›</div>}
+    </button>
+  );
+}
+
+// Full-page detail for a single registry server — name, description,
+// external links, and the technical metadata from the registry entry
+// (remotes / packages / env vars). Discovery-only, no install from here.
+function McpRegistryDetail({ server, onBack }) {
+  const label = server.title || server.name;
+  const hasRemotes = Array.isArray(server.remotes) && server.remotes.length > 0;
+  const hasPackages = Array.isArray(server.packages) && server.packages.length > 0;
+
+  return (
+    <div className="space-y-4">
+      <div className="flex items-center gap-2">
+        <button
+          type="button"
+          onClick={onBack}
+          className="text-xs text-ink-300 hover:text-ink-100 px-2 py-1 rounded hover:bg-ink-800"
+        >
+          ← Back
+        </button>
+        <div className="text-ink-100 text-sm font-medium truncate">{label}</div>
+      </div>
+
+      <Card title="Overview">
+        <div className="flex items-start gap-3">
+          <McpServerIcon server={server} large />
+          <div className="flex-1 min-w-0">
+            <div className="text-base font-semibold text-ink-50 break-words">{label}</div>
+            <div className="text-[11px] text-ink-500 font-mono break-all mt-0.5">{server.name}</div>
+            <div className="flex items-center gap-2 mt-2 flex-wrap">
+              {server.version && <Pill>v{server.version}</Pill>}
+              {server.latest && <Pill tone="ok">latest</Pill>}
+            </div>
+          </div>
+        </div>
+        <div className="text-[13px] text-ink-200 leading-relaxed whitespace-pre-wrap pt-2">
+          {server.description || <span className="italic text-ink-500">No description provided.</span>}
+        </div>
+        {(server.websiteUrl || server.repoUrl) && (
+          <div className="pt-2 flex items-center gap-3 flex-wrap text-[11.5px]">
+            {server.websiteUrl && (
+              <a
+                href={server.websiteUrl}
+                target="_blank"
+                rel="noreferrer"
+                className="text-accent-500 hover:text-accent-600 underline underline-offset-2"
+              >
+                Website ↗
+              </a>
+            )}
+            {server.repoUrl && (
+              <a
+                href={server.repoUrl}
+                target="_blank"
+                rel="noreferrer"
+                className="text-accent-500 hover:text-accent-600 underline underline-offset-2"
+              >
+                {server.repoSource === 'github' ? 'GitHub ↗' : 'Repository ↗'}
+              </a>
+            )}
+          </div>
+        )}
+      </Card>
+
+      {hasRemotes && (
+        <Card title="Remote endpoints" subtitle="Hosted URLs this server exposes.">
+          <div className="space-y-1.5">
+            {server.remotes.map((r, i) => (
+              <div key={i} className="text-xs">
+                <span className="inline-block text-[10.5px] text-ink-400 font-mono bg-ink-900 border border-ink-700/60 rounded px-1.5 py-0.5 mr-2">
+                  {r.type || 'remote'}
+                </span>
+                <span className="text-ink-200 font-mono break-all">{r.url || '(no url)'}</span>
+              </div>
+            ))}
+          </div>
+        </Card>
+      )}
+
+      {hasPackages && (
+        <Card title="Packages" subtitle="Published artifacts you can install and run locally.">
+          <div className="space-y-3">
+            {server.packages.map((p, i) => (
+              <div key={i} className="rounded border border-ink-700/60 bg-ink-900/30 p-2.5 space-y-1.5">
+                <div className="flex items-center gap-2 flex-wrap">
+                  {p.registryType && <Pill>{p.registryType}</Pill>}
+                  {p.transport && <Pill>{p.transport}</Pill>}
+                  {p.runtimeHint && <Pill>{p.runtimeHint}</Pill>}
+                  {p.version && (
+                    <span className="text-[10.5px] text-ink-500 font-mono ml-auto">v{p.version}</span>
+                  )}
+                </div>
+                {p.identifier && (
+                  <div className="text-xs text-ink-200 font-mono break-all">{p.identifier}</div>
+                )}
+                {p.environmentVariables?.length > 0 && (
+                  <div className="pt-1 border-t border-ink-700/40 space-y-1">
+                    <div className="text-[11px] text-ink-400">Environment variables</div>
+                    {p.environmentVariables.map((e) => (
+                      <div key={e.name} className="text-[11.5px] leading-snug">
+                        <span className="text-ink-200 font-mono">{e.name}</span>
+                        {e.isRequired && <span className="ml-1.5 text-[10px] text-accent-500">required</span>}
+                        {e.isSecret && <span className="ml-1.5 text-[10px] text-amber-400">secret</span>}
+                        {e.description && <div className="text-ink-500 mt-0.5">{e.description}</div>}
+                      </div>
+                    ))}
+                  </div>
+                )}
+              </div>
+            ))}
+          </div>
+        </Card>
+      )}
+
+      <div className="flex justify-end">
+        <button
+          type="button"
+          disabled
+          className="text-xs font-medium px-3 py-1.5 rounded bg-ink-700/60 text-ink-400 cursor-not-allowed"
+          title="Install flow coming soon"
+        >
+          Install (coming soon)
+        </button>
+      </div>
+    </div>
+  );
+}
+
+// Small avatar for an MCP server. Prefers the GitHub org avatar when the
+// server has a repository URL; falls back to a letter tile so every row has
+// a consistent visual anchor.
+function McpServerIcon({ server, large = false }) {
+  const [errored, setErrored] = useState(false);
+  const size = large ? 'w-12 h-12 text-base' : 'w-8 h-8 text-xs';
+  const px = large ? 48 : 32;
+  const hasIcon = server.iconUrl && !errored;
+  if (hasIcon) {
+    return (
+      <img
+        src={server.iconUrl}
+        alt=""
+        width={px}
+        height={px}
+        className={`shrink-0 ${size} rounded bg-ink-900 border border-ink-700/60 object-cover`}
+        onError={() => setErrored(true)}
+      />
+    );
+  }
+  // Deterministic letter tile from the first alphanumeric of the label.
+  const label = server.title || server.name || '?';
+  const letter = (label.match(/[a-zA-Z0-9]/)?.[0] || '?').toUpperCase();
+  // Hue derived from the name hash → stable colour per server.
+  let h = 0;
+  for (let i = 0; i < label.length; i++) h = (h * 31 + label.charCodeAt(i)) >>> 0;
+  const hue = h % 360;
+  return (
+    <div
+      className={`shrink-0 ${size} rounded border border-ink-700/60 flex items-center justify-center font-semibold text-ink-50`}
+      style={{ background: `hsl(${hue} 35% 28%)` }}
+      aria-hidden="true"
+    >
+      {letter}
     </div>
   );
 }
@@ -1049,5 +1766,464 @@ function ClaudeBootstrap({ env, onRefresh, onRequestSignIn }) {
         </div>
       )}
     </div>
+  );
+}
+
+// --- Plugins --------------------------------------------------------------
+//
+// Host-side helper processes the Electron main spawns outside the sandbox.
+// See electron/plugins.cjs for the runtime. Two views:
+//   'list'   — every plugin in the catalog with a status pill and Start/Stop.
+//   'detail' — full description, live runtime state (endpoint, logs, errors)
+//              plus a per-plugin settings form rendered from the catalog's
+//              `settingsSchema` field.
+// Start/Stop/Save bump `tick` so visible data refetches.
+
+function PluginsSection() {
+  const [view, setView] = useState('list');
+  const [selected, setSelected] = useState(null);
+  const [tick, setTick] = useState(0);
+
+  if (view === 'detail' && selected) {
+    return (
+      <PluginDetail
+        pluginId={selected}
+        refreshKey={tick}
+        onBack={() => { setSelected(null); setView('list'); }}
+        onChanged={() => setTick((t) => t + 1)}
+      />
+    );
+  }
+
+  return (
+    <PluginList
+      refreshKey={tick}
+      onOpen={(id) => { setSelected(id); setView('detail'); }}
+      onChanged={() => setTick((t) => t + 1)}
+    />
+  );
+}
+
+function PluginList({ refreshKey, onOpen, onChanged }) {
+  const [state, setState] = useState({ loading: true, error: null, plugins: [] });
+
+  const load = async () => {
+    setState((s) => ({ ...s, loading: true, error: null }));
+    try {
+      const out = await listPlugins();
+      setState({ loading: false, error: null, plugins: out.plugins || [] });
+    } catch (e) {
+      setState({ loading: false, error: String(e?.message || e), plugins: [] });
+    }
+  };
+
+  useEffect(() => { load(); }, [refreshKey]);
+
+  const onToggle = async (plugin) => {
+    try {
+      if (plugin.status.state === 'running' || plugin.status.state === 'starting') {
+        await stopPlugin(plugin.id);
+      } else {
+        await startPlugin(plugin.id);
+      }
+      onChanged?.();
+    } catch (e) {
+      window.alert(String(e?.message || e));
+      onChanged?.();
+    }
+  };
+
+  return (
+    <div className="space-y-4">
+      <Card
+        title="Plugins"
+        subtitle="Host-side helpers that run outside the sandbox. Use them to give Claude access to resources the sandbox deliberately hides — a real browser, a shared clipboard, system notifications, etc."
+      >
+        {state.loading && state.plugins.length === 0 && (
+          <div className="text-center text-xs text-ink-500 py-4">Loading…</div>
+        )}
+        {state.error && (
+          <div className="text-xs text-accent-500">{state.error}</div>
+        )}
+        {!state.loading && !state.error && state.plugins.length === 0 && (
+          <div className="py-6 text-center text-sm text-ink-300">No plugins available.</div>
+        )}
+        <div className="space-y-2">
+          {state.plugins.map((p) => (
+            <PluginRow
+              key={p.id}
+              plugin={p}
+              onOpen={() => onOpen(p.id)}
+              onToggle={() => onToggle(p)}
+            />
+          ))}
+        </div>
+      </Card>
+    </div>
+  );
+}
+
+function PluginRow({ plugin, onOpen, onToggle }) {
+  const { status } = plugin;
+  const running = status.state === 'running';
+  const starting = status.state === 'starting';
+  const stopping = status.state === 'stopping';
+  const busy = starting || stopping;
+
+  return (
+    <div className="flex items-start gap-3 rounded-lg border border-ink-700/60 bg-ink-900/30 px-3 py-2.5">
+      <McpServerIcon server={{ iconUrl: plugin.iconUrl, title: plugin.name, name: plugin.id }} />
+      <div className="flex-1 min-w-0">
+        <div className="flex items-baseline gap-2 flex-wrap">
+          <button
+            type="button"
+            onClick={onOpen}
+            className="text-sm font-medium text-ink-100 hover:text-accent-400 truncate"
+          >
+            {plugin.name}
+          </button>
+          <div className="text-[11px] text-ink-500 font-mono truncate">{plugin.id}</div>
+          <PluginStatePill state={status.state} adopted={status.adopted} />
+        </div>
+        {plugin.description && (
+          <div className="text-[12px] text-ink-300 mt-1 line-clamp-2">{plugin.description}</div>
+        )}
+        {status.state === 'error' && status.lastError && (
+          <div className="text-[11.5px] text-accent-500 mt-1">{status.lastError}</div>
+        )}
+        {running && status.endpoint && (
+          <div className="text-[11px] text-ink-500 font-mono mt-1 truncate">{status.endpoint}</div>
+        )}
+      </div>
+      <div className="flex items-center gap-2 shrink-0">
+        <button
+          type="button"
+          onClick={onOpen}
+          className="text-[11px] px-2 py-1 rounded border border-ink-700/60 text-ink-300 hover:text-ink-100 hover:bg-ink-800"
+        >
+          Configure
+        </button>
+        <button
+          type="button"
+          onClick={onToggle}
+          disabled={busy}
+          className={`text-[11px] px-2.5 py-1 rounded font-medium transition-colors disabled:opacity-60
+            ${running
+              ? 'bg-ink-700/60 text-ink-100 hover:bg-ink-700'
+              : 'bg-accent-500 text-ink-950 hover:bg-accent-400'}`}
+        >
+          {starting ? 'Starting…' : stopping ? 'Stopping…' : running ? 'Stop' : 'Start'}
+        </button>
+      </div>
+    </div>
+  );
+}
+
+function PluginStatePill({ state, adopted }) {
+  if (state === 'running') return <Pill tone="ok">{adopted ? 'running (adopted)' : 'running'}</Pill>;
+  if (state === 'starting') return <Pill tone="warn">starting</Pill>;
+  if (state === 'stopping') return <Pill tone="warn">stopping</Pill>;
+  if (state === 'error') return <Pill tone="bad">error</Pill>;
+  return <Pill>stopped</Pill>;
+}
+
+function PluginDetail({ pluginId, refreshKey, onBack, onChanged }) {
+  const [state, setState] = useState({ loading: true, error: null, plugin: null });
+  // `draft` holds unsaved edits. Initialised from the plugin's persisted
+  // settings on first load and deliberately NOT overwritten by subsequent
+  // status-refresh fetches — otherwise edits would vanish mid-typing.
+  const [draft, setDraft] = useState(null);
+  const [saving, setSaving] = useState(false);
+  const [saveError, setSaveError] = useState(null);
+
+  const load = async () => {
+    try {
+      const out = await listPlugins();
+      const plugin = (out.plugins || []).find((p) => p.id === pluginId);
+      if (!plugin) throw new Error(`plugin "${pluginId}" not found`);
+      setState({ loading: false, error: null, plugin });
+      setDraft((d) => d || { ...plugin.settings });
+    } catch (e) {
+      setState({ loading: false, error: String(e?.message || e), plugin: null });
+    }
+  };
+
+  useEffect(() => { load(); }, [pluginId, refreshKey]);
+
+  // Poll while the detail view is open so state transitions (starting →
+  // running, running → error) show up without user intervention.
+  useEffect(() => {
+    const t = setInterval(() => { load(); }, 2000);
+    return () => clearInterval(t);
+  }, [pluginId]);
+
+  const onSave = async () => {
+    if (!draft) return;
+    setSaving(true);
+    setSaveError(null);
+    try {
+      await updatePluginSettings(pluginId, draft);
+      onChanged?.();
+    } catch (e) {
+      setSaveError(String(e?.message || e));
+    } finally {
+      setSaving(false);
+    }
+  };
+
+  const onToggle = async () => {
+    try {
+      if (state.plugin?.status.state === 'running' || state.plugin?.status.state === 'starting') {
+        await stopPlugin(pluginId);
+      } else {
+        await startPlugin(pluginId);
+      }
+      onChanged?.();
+    } catch (e) {
+      window.alert(String(e?.message || e));
+      onChanged?.();
+    }
+  };
+
+  if (state.loading && !state.plugin) {
+    return <div className="text-center text-xs text-ink-500 py-8">Loading…</div>;
+  }
+  if (state.error) {
+    return (
+      <div className="space-y-3">
+        <BackLink onClick={onBack} />
+        <div className="text-xs text-accent-500">{state.error}</div>
+      </div>
+    );
+  }
+
+  const plugin = state.plugin;
+  const status = plugin.status;
+  const running = status.state === 'running';
+  const starting = status.state === 'starting';
+  const stopping = status.state === 'stopping';
+  const busy = starting || stopping;
+  const schema = plugin.settingsSchema || [];
+  // Save is enabled only if something in the draft diverges from persisted.
+  const dirty = !!draft && Object.keys(draft).some(
+    (k) => String(draft[k] ?? '') !== String((plugin.settings || {})[k] ?? ''),
+  );
+
+  return (
+    <div className="space-y-4">
+      <BackLink onClick={onBack} />
+
+      <div className="flex items-start gap-3">
+        <McpServerIcon server={{ iconUrl: plugin.iconUrl, title: plugin.name, name: plugin.id }} large />
+        <div className="flex-1 min-w-0">
+          <div className="flex items-baseline gap-2 flex-wrap">
+            <div className="text-base font-medium text-ink-100">{plugin.name}</div>
+            <div className="text-[11px] text-ink-500 font-mono">{plugin.id}</div>
+            <PluginStatePill state={status.state} adopted={status.adopted} />
+          </div>
+          {plugin.description && (
+            <div className="text-[12.5px] text-ink-300 mt-1">{plugin.description}</div>
+          )}
+        </div>
+        <button
+          type="button"
+          onClick={onToggle}
+          disabled={busy}
+          className={`text-xs px-3 py-1.5 rounded font-medium transition-colors disabled:opacity-60
+            ${running
+              ? 'bg-ink-700/60 text-ink-100 hover:bg-ink-700'
+              : 'bg-accent-500 text-ink-950 hover:bg-accent-400'}`}
+        >
+          {starting ? 'Starting…' : stopping ? 'Stopping…' : running ? 'Stop' : 'Start'}
+        </button>
+      </div>
+
+      <Card title="Runtime" subtitle="Live status of the plugin process.">
+        <Row label="State"><PluginStatePill state={status.state} adopted={status.adopted} /></Row>
+        {status.endpoint && (
+          <Row label="Endpoint">
+            <code className="text-[11.5px] text-ink-200 font-mono break-all">{status.endpoint}</code>
+          </Row>
+        )}
+        {status.pid && (
+          <Row label="PID">
+            <span className="text-[11.5px] text-ink-300 font-mono">{status.pid}</span>
+          </Row>
+        )}
+        {status.startedAt && (
+          <Row label="Started">
+            <span className="text-[11.5px] text-ink-300">{new Date(status.startedAt).toLocaleTimeString()}</span>
+          </Row>
+        )}
+        {status.lastError && (
+          <Row label="Last error">
+            <span className="text-[11.5px] text-accent-500 break-words">{status.lastError}</span>
+          </Row>
+        )}
+        {status.logs && status.logs.length > 0 && (
+          <div>
+            <div className="text-[11px] text-ink-500 mb-1">Recent log lines</div>
+            <div className="font-mono text-[10.5px] text-ink-300 bg-ink-950 border border-ink-700/60 rounded-md p-2 max-h-40 overflow-y-auto whitespace-pre-wrap break-all">
+              {status.logs.join('\n')}
+            </div>
+          </div>
+        )}
+      </Card>
+
+      {plugin.chrome && (
+        <ChromeDetectionCard
+          chrome={plugin.chrome}
+          currentSetting={(draft?.chromePath ?? plugin.settings?.chromePath ?? '').trim()}
+          onPick={(path) => setDraft((d) => ({ ...(d || plugin.settings || {}), chromePath: path }))}
+        />
+      )}
+
+      {schema.length > 0 && (
+        <Card
+          title="Settings"
+          subtitle={`Stored in ~/.cowork/plugins.json (mode 0600). Changes apply the next time ${plugin.name} starts.`}
+        >
+          <PluginSettingsForm
+            schema={schema}
+            values={draft || plugin.settings || {}}
+            onChange={(k, v) => setDraft((d) => ({ ...(d || {}), [k]: v }))}
+          />
+          <div className="flex items-center justify-end gap-3 pt-2">
+            {saveError && <div className="text-[11.5px] text-accent-500 flex-1">{saveError}</div>}
+            <button
+              type="button"
+              onClick={() => setDraft({ ...plugin.settings })}
+              disabled={!dirty || saving}
+              className="text-[11px] px-3 py-1.5 rounded border border-ink-700/60 text-ink-300 hover:text-ink-100 hover:bg-ink-800 disabled:opacity-60"
+            >
+              Reset
+            </button>
+            <button
+              type="button"
+              onClick={onSave}
+              disabled={!dirty || saving}
+              className="text-[11px] px-3 py-1.5 rounded bg-accent-500 text-ink-950 font-medium hover:bg-accent-400 disabled:opacity-60"
+            >
+              {saving ? 'Saving…' : 'Save'}
+            </button>
+          </div>
+        </Card>
+      )}
+
+      {plugin.notes && (
+        <div className="text-[11.5px] text-ink-400 border-l-2 border-ink-700/60 pl-3">{plugin.notes}</div>
+      )}
+    </div>
+  );
+}
+
+// Chrome-specific detection panel. Shows which binary auto-detect chose
+// (or would choose, given the current draft setting) plus every other
+// Chrome-family binary we can see on the machine. Clicking a candidate
+// writes it into the draft so the user can Save to lock it in.
+function ChromeDetectionCard({ chrome, currentSetting, onPick }) {
+  const detected = chrome.detected;
+  const candidates = Array.isArray(chrome.candidates) ? chrome.candidates : [];
+  const alternatives = candidates.filter((c) => c !== detected);
+
+  return (
+    <Card
+      title="Chrome binary"
+      subtitle="Leave the setting blank to auto-detect, or click a candidate below to lock in a specific install."
+    >
+      <Row label="Will use">
+        {detected ? (
+          <code className="text-[11.5px] text-ink-200 font-mono break-all">{detected}</code>
+        ) : (
+          <span className="text-[11.5px] text-accent-500">
+            No Chrome found. Install Google Chrome or Chromium, or set an absolute path in the setting below.
+          </span>
+        )}
+      </Row>
+      {currentSetting && (
+        <Row label="Setting">
+          <code className="text-[11.5px] text-ink-300 font-mono break-all">{currentSetting}</code>
+        </Row>
+      )}
+      {alternatives.length > 0 && (
+        <div>
+          <div className="text-[11px] text-ink-500 mb-1.5">Other installs detected</div>
+          <div className="flex flex-wrap gap-1.5">
+            {alternatives.map((c) => (
+              <button
+                key={c}
+                type="button"
+                onClick={() => onPick(c)}
+                className="text-[11px] font-mono px-2 py-1 rounded border border-ink-700/60 bg-ink-900/40 text-ink-300 hover:text-ink-100 hover:border-accent-500/60"
+                title={`Set Chrome binary to ${c}`}
+              >
+                {c}
+              </button>
+            ))}
+          </div>
+          <div className="text-[11px] text-ink-500 mt-1.5">
+            Click one to write it into the settings draft below; then hit Save.
+          </div>
+        </div>
+      )}
+    </Card>
+  );
+}
+
+// Render form inputs from the catalog's `settingsSchema` array. Each entry
+// is { key, label, description, type, default, placeholder?, min?, max? }.
+// `type` is one of text | number | boolean.
+function PluginSettingsForm({ schema, values, onChange }) {
+  if (!Array.isArray(schema) || schema.length === 0) {
+    return <div className="text-[11px] text-ink-500">This plugin has no settings.</div>;
+  }
+  return (
+    <div className="space-y-3">
+      {schema.map((s) => (
+        <Field key={s.key} label={s.label} hint={s.description}>
+          {s.type === 'boolean' ? (
+            <label className="inline-flex items-center gap-2 cursor-pointer">
+              <input
+                type="checkbox"
+                checked={!!values[s.key]}
+                onChange={(e) => onChange(s.key, e.target.checked)}
+                className="accent-accent-500"
+              />
+              <span className="text-xs text-ink-300">{values[s.key] ? 'Enabled' : 'Disabled'}</span>
+            </label>
+          ) : s.type === 'number' ? (
+            <input
+              type="number"
+              value={values[s.key] ?? ''}
+              onChange={(e) => onChange(s.key, e.target.value === '' ? '' : Number(e.target.value))}
+              min={s.min}
+              max={s.max}
+              placeholder={s.placeholder || ''}
+              className="w-full bg-ink-900 border border-ink-700/60 rounded px-2 py-1.5 text-sm text-ink-100 focus:outline-none focus:border-accent-500/60"
+            />
+          ) : (
+            <input
+              type="text"
+              value={values[s.key] ?? ''}
+              onChange={(e) => onChange(s.key, e.target.value)}
+              placeholder={s.placeholder || ''}
+              className="w-full bg-ink-900 border border-ink-700/60 rounded px-2 py-1.5 text-sm text-ink-100 focus:outline-none focus:border-accent-500/60"
+            />
+          )}
+        </Field>
+      ))}
+    </div>
+  );
+}
+
+function BackLink({ onClick }) {
+  return (
+    <button
+      type="button"
+      onClick={onClick}
+      className="text-[11px] text-ink-400 hover:text-ink-100"
+    >
+      ← Back
+    </button>
   );
 }

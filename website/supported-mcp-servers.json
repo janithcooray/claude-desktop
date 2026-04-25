@@ -1,0 +1,68 @@
+{
+  "$schema": "./supported-mcp-servers.schema.json",
+  "version": 1,
+  "updatedAt": "2026-04-25",
+  "description": "Curated list of MCP servers Cowork knows how to install and configure. Each entry includes a `spec` that is written directly into the user's ~/.claude.json under `mcpServers`, plus optional `params` (runtime-only values) and `env` (secret/config env vars) the UI must collect before activating.",
+  "servers": [
+    {
+      "id": "memestack",
+      "name": "MemeStack",
+      "registryName": "ai.memestack/mcp",
+      "description": "Search and browse a curated gallery of memes, infographics, and visual content. Remote server — no install and no credentials required.",
+      "iconUrl": "https://github.com/memestack-ai.png?size=64",
+      "homepage": "https://mcp.memestack.ai",
+      "categories": ["images", "search"],
+      "spec": {
+        "type": "http",
+        "url": "https://mcp.memestack.ai/mcp"
+      },
+      "params": [],
+      "env": [],
+      "prerequisites": null,
+      "notes": "Remote HTTPS, no auth, no params. Handy sanity check for the Cowork MCP pipeline."
+    },
+    {
+      "id": "graphlit",
+      "name": "Graphlit",
+      "registryName": "graphlit-mcp-server",
+      "description": "Ingest documents, web pages, Slack/Drive/Jira/Linear/GitHub and more into a Graphlit project and query it as a RAG-ready knowledge base.",
+      "iconUrl": "https://github.com/graphlit.png?size=64",
+      "homepage": "https://github.com/graphlit/graphlit-mcp-server",
+      "categories": ["knowledge", "rag", "search"],
+      "spec": {
+        "type": "stdio",
+        "command": "npx",
+        "args": ["-y", "graphlit-mcp-server"]
+      },
+      "params": [],
+      "env": [
+        {
+          "key": "GRAPHLIT_ORGANIZATION_ID",
+          "label": "Graphlit Organization ID",
+          "description": "Copy from the API settings dashboard on the Graphlit portal.",
+          "helpUrl": "https://portal.graphlit.dev",
+          "type": "text",
+          "required": true
+        },
+        {
+          "key": "GRAPHLIT_ENVIRONMENT_ID",
+          "label": "Graphlit Environment ID",
+          "description": "Also on the API settings dashboard — sits next to the Organization ID.",
+          "helpUrl": "https://portal.graphlit.dev",
+          "type": "text",
+          "required": true
+        },
+        {
+          "key": "GRAPHLIT_JWT_SECRET",
+          "label": "Graphlit JWT secret",
+          "description": "Signs JWTs for the Graphlit API. Copy from the API settings dashboard on the Graphlit portal.",
+          "helpUrl": "https://portal.graphlit.dev",
+          "type": "secret",
+          "required": true
+        }
+      ],
+      "prerequisites": { "linux": { "runtime": "node", "minVersion": "18" } },
+      "notes": "Optional connector credentials (SLACK_BOT_TOKEN, LINEAR_API_KEY, GITHUB_PERSONAL_ACCESS_TOKEN, NOTION_API_KEY, JIRA_EMAIL + JIRA_TOKEN, Google Mail tokens, DISCORD_BOT_TOKEN, TWITTER_TOKEN) can be added later by editing the entry in ~/.claude.json directly if you want to enable specific data connectors."
+    }
+  ]
+}

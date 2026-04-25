@@ -1,6 +1,6 @@
 {
   "name": "cowork-desktop",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "Claude Cowork-style desktop shell. Drives the headless `claude` CLI directly from the Electron main process.",
   "main": "electron/main.cjs",
   "private": true,
@@ -34,9 +34,14 @@
     "appId": "com.cowork.desktop",
     "productName": "Cowork",
     "asar": true,
+    "asarUnpack": [
+      "electron/approval-mcp.cjs"
+    ],
     "files": [
       "electron/**/*",
       "dist/**/*",
+      "website/supported-mcp-servers.json",
+      "website/supported-plugins.json",
       "package.json"
     ],
     "linux": {

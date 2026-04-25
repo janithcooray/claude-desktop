@@ -22,13 +22,33 @@
 // CLI's first `system/init` event.
 
 const http = require('node:http');
+const https = require('node:https');
 const net = require('node:net');
+const os = require('node:os');
 const path = require('node:path');
 const fs = require('node:fs');
 const fsp = require('node:fs/promises');
 const { spawn } = require('node:child_process');
 
 const { detectSandbox, wrapWithSandbox } = require('./sandbox.cjs');
+const plugins = require('./plugins.cjs');
+const approval = require('./approval.cjs');
+
+// Filled in by startBackend() once we've grabbed a port. The approval MCP
+// shim (spawned inside the sandbox by the Claude CLI) needs to know it so it
+// can POST decisions back to /approval/request.
+let BACKEND_PORT = 0;
+
+// Absolute path to the stdio MCP shim that fronts the approval broker. We
+// bind-mount the directory containing it into the sandbox so the spawned CLI
+// can `node <path>` it. In packaged builds the shim is asar-unpacked (see
+// package.json's build.asarUnpack) so spawn can read it as a real file.
+const APPROVAL_MCP_PATH = path.join(__dirname, 'approval-mcp.cjs').replace(
+  `${path.sep}app.asar${path.sep}`,
+  `${path.sep}app.asar.unpacked${path.sep}`,
+);
+const APPROVAL_MCP_DIR = path.dirname(APPROVAL_MCP_PATH);
+const APPROVAL_TOOL_NAME = 'mcp__cowork-approval__prompt';
 
 const ALLOWED_TOOLS_DEFAULT = 'Read,Write,Edit,Bash,Glob,Grep';
 const PERMISSION_MODE_DEFAULT = 'acceptEdits';
@@ -136,6 +156,13 @@ function snapshotFiles(root) {
 //   managed === true  → backend created the dir, DELETE should rm it
 //   managed === false → user picked an existing folder, DELETE leaves it alone
 const sessions = new Map();
+
+// Map<clientRef, { cwd, addDirs }> — lightweight chat→roots registry the
+// renderer populates whenever a chat becomes active. Lets the chat-keyed
+// file route (`/chats/:clientRef/files/...`) resolve files that live under
+// user-attached folders *without* requiring a live CLI session. Cleared on
+// every backend restart (the renderer re-registers on chat switch).
+const chatRoots = new Map();
 
 // ---------- tiny response helpers ----------
 
@@ -270,6 +297,334 @@ async function getAuthStatus() {
     exitCode: r.code,
     error: r.error || null,
   };
+}
+
+// ---------- MCP registry --------------------------------------------------
+//
+// The official registry at https://registry.modelcontextprotocol.io publishes
+// a paginated list of servers. We fetch it from the Electron main process so
+// the renderer isn't subject to CORS, and keep a short in-memory cache so
+// re-opening the Settings tab doesn't hammer the API.
+//
+// Response fields we care about (per server object):
+//   name, title, description, version, websiteUrl
+//   repository.url (when backed by a git repo; used for GitHub avatar icon)
+//   _meta.io.modelcontextprotocol.registry/official.isLatest
+//
+// We paginate through `nextCursor` until exhausted or until a safety cap is
+// hit, then dedupe to the latest version of each server and normalise to a
+// small shape the renderer can render without knowing the schema.
+
+const MCP_REGISTRY_BASE = 'https://registry.modelcontextprotocol.io/v0';
+const MCP_CACHE_TTL_MS = 5 * 60 * 1000; // 5 minutes
+let mcpCache = { at: 0, servers: null };
+
+function httpsGetJson(url, { timeoutMs = 15000 } = {}) {
+  return new Promise((resolve, reject) => {
+    const req = https.get(url, { headers: { 'Accept': 'application/json', 'User-Agent': 'cowork-desktop' } }, (r) => {
+      if (r.statusCode !== 200) {
+        r.resume();
+        return reject(new Error(`HTTP ${r.statusCode} for ${url}`));
+      }
+      const chunks = [];
+      r.on('data', (c) => chunks.push(c));
+      r.on('end', () => {
+        const body = Buffer.concat(chunks).toString('utf8');
+        try { resolve(JSON.parse(body)); } catch (e) { reject(new Error(`bad JSON from ${url}: ${e.message}`)); }
+      });
+    });
+    req.on('error', reject);
+    req.setTimeout(timeoutMs, () => { req.destroy(new Error(`timeout fetching ${url}`)); });
+  });
+}
+
+// Pull every page of /v0/servers. `max` caps total servers returned to keep
+// initial load snappy; the registry has thousands of entries and the UI
+// currently just lists them — we don't need them all at once.
+async function fetchAllMcpServers({ max = 500 } = {}) {
+  const out = [];
+  let cursor = null;
+  let pages = 0;
+  const MAX_PAGES = 20; // safety net against cursor loops
+  while (pages < MAX_PAGES) {
+    const url = new URL(`${MCP_REGISTRY_BASE}/servers`);
+    url.searchParams.set('limit', '100');
+    if (cursor) url.searchParams.set('cursor', cursor);
+    const page = await httpsGetJson(url.toString());
+    const list = Array.isArray(page?.servers) ? page.servers : [];
+    for (const entry of list) {
+      out.push(entry);
+      if (out.length >= max) return out;
+    }
+    cursor = page?.metadata?.nextCursor || null;
+    pages += 1;
+    if (!cursor || list.length === 0) break;
+  }
+  return out;
+}
+
+// GitHub avatar URL for a `https://github.com/<org>/<repo>` repository.
+// Works without auth and returns an image even if the org doesn't have a
+// custom logo (default octocat-style placeholder).
+function iconFromRepoUrl(repoUrl) {
+  if (!repoUrl) return null;
+  try {
+    const u = new URL(repoUrl);
+    if (u.hostname !== 'github.com') return null;
+    const [org] = u.pathname.replace(/^\//, '').split('/');
+    if (!org) return null;
+    return `https://github.com/${encodeURIComponent(org)}.png?size=64`;
+  } catch { return null; }
+}
+
+// Normalise one registry entry to the shape the renderer consumes. Collapses
+// the nested `server` + `_meta` structure into a flat card-friendly object
+// that carries enough fields for both the list row AND the detail view
+// (remotes, packages, env vars). Unknown/missing fields become null/[] so
+// the renderer can cleanly conditionally render each block.
+function normaliseServer(entry) {
+  const s = entry?.server || {};
+  const repo = s?.repository || null;
+  const repoUrl = repo?.url || null;
+  const latest = !!entry?._meta?.['io.modelcontextprotocol.registry/official']?.isLatest;
+  // Keep only the fields we actually render; dropping everything else keeps
+  // the response small (the registry emits a lot of schema scaffolding we
+  // don't need in the UI).
+  const remotes = Array.isArray(s.remotes) ? s.remotes.map((r) => ({
+    type: r.type || null,
+    url: r.url || null,
+  })) : [];
+  const packages = Array.isArray(s.packages) ? s.packages.map((p) => ({
+    registryType: p.registryType || null,
+    identifier: p.identifier || null,
+    version: p.version || null,
+    runtimeHint: p.runtimeHint || null,
+    transport: p.transport?.type || null,
+    environmentVariables: Array.isArray(p.environmentVariables) ? p.environmentVariables.map((e) => ({
+      name: e.name,
+      description: e.description || '',
+      isRequired: !!e.isRequired,
+      isSecret: !!e.isSecret,
+    })) : [],
+  })) : [];
+  return {
+    name: s.name || '(unnamed)',
+    title: s.title || null,
+    description: s.description || '',
+    version: s.version || null,
+    websiteUrl: s.websiteUrl || null,
+    repoUrl,
+    repoSource: repo?.source || null,
+    iconUrl: iconFromRepoUrl(repoUrl),
+    latest,
+    remotes,
+    packages,
+  };
+}
+
+async function getMcpRegistryServers({ force = false } = {}) {
+  const now = Date.now();
+  if (!force && mcpCache.servers && (now - mcpCache.at) < MCP_CACHE_TTL_MS) {
+    return { servers: mcpCache.servers, cachedAt: mcpCache.at };
+  }
+  const raw = await fetchAllMcpServers({ max: 500 });
+  // Keep only the latest version of each server name — the registry returns
+  // one entry per published version, so the same server often appears 3-5x.
+  const latestByName = new Map();
+  for (const entry of raw) {
+    const norm = normaliseServer(entry);
+    if (!norm.name) continue;
+    const existing = latestByName.get(norm.name);
+    if (!existing || (norm.latest && !existing.latest)) {
+      latestByName.set(norm.name, norm);
+    }
+  }
+  const servers = Array.from(latestByName.values())
+    .sort((a, b) => (a.title || a.name).localeCompare(b.title || b.name));
+  mcpCache = { at: now, servers };
+  return { servers, cachedAt: now };
+}
+
+// ---------- Cowork-supported MCP catalog + install -----------------------
+//
+// Cowork maintains its own vetted subset of the MCP ecosystem in
+// `website/supported-mcp-servers.json`. The full public registry is huge and
+// unvetted; this curated list is what we actually know how to install and
+// configure end-to-end via the UI.
+//
+// HOW COWORK TALKS TO AN INSTALLED MCP SERVER
+// -------------------------------------------
+// Installing a server boils down to writing one entry under
+// `mcpServers.<id>` in the user's ~/.claude.json. The Claude CLI reads that
+// file every time Cowork spawns it (once per chat turn), auto-connects to
+// each configured server, and exposes the server's tools to the model:
+//
+//   stdio servers   — CLI spawns <command> <args...> with the provided env
+//                     and speaks JSON-RPC over stdin/stdout.
+//   http servers    — CLI opens a streamable HTTP connection to <url>,
+//                     attaching any configured headers (e.g. bearer token).
+//
+// Our sandbox must allow whatever the server needs: outbound HTTPS for http
+// servers (DNS fix + open net namespace — already in place), and the server
+// command's binary chain for stdio servers (the sandbox already exposes
+// /usr/bin + the claude chain; we'll extend it as we pick up stdio entries).
+//
+// AUTH / PARAMS
+// -------------
+// Each curated entry declares:
+//   params[] — runtime values (paths, project names, …) substituted into
+//              `{placeholder}` tokens inside spec.args. `expand: "split"`
+//              splits a comma-separated value into multiple args.
+//   env[]    — environment variables, typically API keys / tokens. Values
+//              are written into spec.env and passed to the child process.
+//              `isSecret` hints the UI to use a password input.
+//
+// We only store env values on disk inside ~/.claude.json, which is owned
+// mode 0600 by the user — the same file the CLI already keeps credentials
+// in. We never transmit env values to our backend beyond the install call.
+
+const CURATED_PATH = path.join(__dirname, '..', 'website', 'supported-mcp-servers.json');
+
+// Where user-level MCP config lives. Claude Code reads ~/.claude.json on
+// startup and each child spawn; writing there is how we "install" a server.
+function claudeJsonPath() {
+  return path.join(os.homedir(), '.claude.json');
+}
+
+function readCuratedCatalog() {
+  const raw = fs.readFileSync(CURATED_PATH, 'utf8');
+  const parsed = JSON.parse(raw);
+  const servers = Array.isArray(parsed.servers) ? parsed.servers : [];
+  return { version: parsed.version || 1, updatedAt: parsed.updatedAt || null, servers };
+}
+
+function readClaudeJson() {
+  try {
+    const raw = fs.readFileSync(claudeJsonPath(), 'utf8');
+    if (!raw.trim()) return {};
+    return JSON.parse(raw);
+  } catch (e) {
+    if (e.code === 'ENOENT') return {};
+    throw e;
+  }
+}
+
+function writeClaudeJson(cfg) {
+  const p = claudeJsonPath();
+  const body = JSON.stringify(cfg, null, 2) + '\n';
+  // Tight perms — the file can contain API keys.
+  fs.writeFileSync(p, body, { mode: 0o600 });
+}
+
+// List MCP servers currently configured in ~/.claude.json. Annotates each
+// with the curated metadata (title, description, icon) when we recognise
+// the id, so the UI can render a consistent row whether or not the entry
+// came through Cowork.
+function listInstalledMcpServers() {
+  const cfg = readClaudeJson();
+  const servers = cfg?.mcpServers && typeof cfg.mcpServers === 'object' ? cfg.mcpServers : {};
+  let curatedById = new Map();
+  try {
+    const { servers: cList } = readCuratedCatalog();
+    curatedById = new Map(cList.map((s) => [s.id, s]));
+  } catch { /* curated JSON missing is non-fatal */ }
+  const out = [];
+  for (const [id, spec] of Object.entries(servers)) {
+    const curated = curatedById.get(id) || null;
+    out.push({
+      id,
+      name: curated?.name || id,
+      description: curated?.description || null,
+      iconUrl: curated?.iconUrl || null,
+      transport: spec?.type || (spec?.url ? 'http' : (spec?.command ? 'stdio' : 'unknown')),
+      url: spec?.url || null,
+      command: spec?.command || null,
+      curated: !!curated,
+    });
+  }
+  return out.sort((a, b) => a.name.localeCompare(b.name));
+}
+
+// Substitute `{paramKey}` placeholders in the spec's args with values from
+// the install form. `params[].expand === 'split'` turns a single field into
+// multiple positional args (e.g. the filesystem server's allowed paths).
+function materialiseSpec(curated, paramValues, envValues) {
+  const base = JSON.parse(JSON.stringify(curated.spec || {}));
+  const paramsDef = Array.isArray(curated.params) ? curated.params : [];
+  const envDef = Array.isArray(curated.env) ? curated.env : [];
+
+  if (Array.isArray(base.args)) {
+    const expanded = [];
+    for (const arg of base.args) {
+      if (typeof arg !== 'string') { expanded.push(arg); continue; }
+      const m = /^\{([a-zA-Z0-9_]+)\}$/.exec(arg);
+      if (!m) { expanded.push(arg); continue; }
+      const key = m[1];
+      const def = paramsDef.find((p) => p.key === key);
+      const v = paramValues?.[key];
+      if (v == null || v === '') {
+        if (def?.required) throw new Error(`missing required param: ${key}`);
+        continue;
+      }
+      if (def?.expand === 'split') {
+        for (const piece of String(v).split(',').map((s) => s.trim()).filter(Boolean)) {
+          expanded.push(piece);
+        }
+      } else {
+        expanded.push(String(v));
+      }
+    }
+    base.args = expanded;
+  }
+
+  const env = {};
+  for (const e of envDef) {
+    const v = envValues?.[e.key];
+    if (v == null || v === '') {
+      if (e.required) throw new Error(`missing required env: ${e.key}`);
+      continue;
+    }
+    env[e.key] = String(v);
+  }
+  if (Object.keys(env).length) base.env = env;
+
+  return base;
+}
+
+function installCuratedMcpServer(id, paramValues, envValues) {
+  const { servers } = readCuratedCatalog();
+  const curated = servers.find((s) => s.id === id);
+  if (!curated) throw new Error(`unknown curated server id: ${id}`);
+  const spec = materialiseSpec(curated, paramValues || {}, envValues || {});
+  const cfg = readClaudeJson();
+  cfg.mcpServers = cfg.mcpServers && typeof cfg.mcpServers === 'object' ? cfg.mcpServers : {};
+  cfg.mcpServers[id] = spec;
+  writeClaudeJson(cfg);
+  return { id, spec };
+}
+
+function uninstallMcpServer(id) {
+  const cfg = readClaudeJson();
+  if (!cfg.mcpServers || !(id in cfg.mcpServers)) return { id, removed: false };
+  delete cfg.mcpServers[id];
+  writeClaudeJson(cfg);
+  return { id, removed: true };
+}
+
+// Claude Code's tool gate prompts on first use of any tool not in
+// --allowed-tools — including MCP tools exposed as `mcp__<id>__<name>`.
+// Cowork runs headless, so a prompt = a dead turn. We read the live list of
+// installed MCP servers before every spawn and auto-allow all their tools
+// by emitting one `mcp__<id>` entry per server (the CLI treats that prefix
+// as "all tools from this server").
+function installedMcpAllowEntries() {
+  try {
+    const cfg = readClaudeJson();
+    const servers = cfg?.mcpServers && typeof cfg.mcpServers === 'object' ? cfg.mcpServers : {};
+    return Object.keys(servers).map((id) => `mcp__${id}`);
+  } catch {
+    return [];
+  }
 }
 
 // Is Docker installed and reachable? We try `docker version --format json`
@@ -559,7 +914,7 @@ function onPath(prog) {
   return false;
 }
 
-function startClaude({ prompt, cwd, resumeId, mode, model, addDirs, permissionMode, allowedTools, disallowedTools, shellMode, dockerImage }) {
+function startClaude({ prompt, cwd, resumeId, mode, model, addDirs, permissionMode, allowedTools, disallowedTools, shellMode, dockerImage, sessionId }) {
   const bin = resolveClaudeBin();
   // Jailbroken mode: flip the defaults to "no guardrails" before the normal
   // flag assembly below runs. The user's explicit per-session overrides still
@@ -583,16 +938,24 @@ function startClaude({ prompt, cwd, resumeId, mode, model, addDirs, permissionMo
     || process.env.PERMISSION_MODE
     || PERMISSION_MODE_DEFAULT;
   const effDisallowed = disallowedTools && disallowedTools.trim() ? disallowedTools.trim() : null;
+  // Fold in the user's installed MCP servers so their tools don't trigger a
+  // permission prompt on first use. Cowork can't surface those prompts, so
+  // any gated MCP call would hang the turn forever. Conversational Q&A from
+  // the model isn't affected — only the CLI's tool-gate prompts are.
+  const mcpAllow = installedMcpAllowEntries();
+  const withMcp = (base) => mcpAllow.length
+    ? [base, ...mcpAllow].filter(Boolean).join(',')
+    : base;
   if (mode === 'chat') {
     // General-purpose assistant: a tight allow-list of retrieval tools, plus
     // an explicit disallow-list for everything filesystem / shell related.
     // We also reframe the persona so Claude stops introducing itself as a
     // software engineering assistant.
-    claudeArgs.push('--allowed-tools', CHAT_MODE_ALLOWED_TOOLS);
+    claudeArgs.push('--allowed-tools', withMcp(CHAT_MODE_ALLOWED_TOOLS));
     claudeArgs.push('--disallowed-tools', CHAT_MODE_DISALLOWED_TOOLS);
     claudeArgs.push('--append-system-prompt', CHAT_MODE_APPEND_SYSTEM_PROMPT);
   } else {
-    claudeArgs.push('--allowed-tools', effAllowed);
+    claudeArgs.push('--allowed-tools', withMcp(effAllowed));
     claudeArgs.push('--permission-mode', effPerm);
     if (effDisallowed) claudeArgs.push('--disallowed-tools', effDisallowed);
     // Extra working folders the user attached. The CLI's --add-dir flag widens
@@ -601,15 +964,56 @@ function startClaude({ prompt, cwd, resumeId, mode, model, addDirs, permissionMo
     for (const d of (addDirs || [])) {
       if (d && typeof d === 'string') claudeArgs.push('--add-dir', d);
     }
+    // Wire the user-approval gate. When the model tries to use a tool that
+    // isn't covered by --allowed-tools (Bash with a fresh command, Write to a
+    // new path, an MCP tool the user hasn't pre-allowed, …), the CLI calls
+    // this MCP tool instead of dying or silently auto-allowing. The shim
+    // POSTs to /approval/request, the broker pops a Cowork modal + native DE
+    // notification, the user clicks Allow/Deny, and the answer flows back to
+    // the CLI. See electron/approval.cjs and electron/approval-mcp.cjs for
+    // the full architecture.
+    //
+    // We only do this in non-chat modes. Chat mode's tool surface is fixed
+    // (allow=WebSearch/WebFetch/TodoWrite, disallow=everything else) so a
+    // permission gate would never fire there anyway.
+    //
+    // Docker shell mode is excluded because the shim runs inside the
+    // container — `127.0.0.1:<BACKEND_PORT>` from there points at the
+    // container, not the host backend, so the POST would fail. Docker users
+    // already opt into looser tooling; this is a known gap to revisit if
+    // docker mode becomes mainstream.
+    if (BACKEND_PORT && sm !== 'docker' && fs.existsSync(APPROVAL_MCP_PATH)) {
+      const mcpConfig = {
+        mcpServers: {
+          'cowork-approval': {
+            type: 'stdio',
+            command: 'node',
+            args: [APPROVAL_MCP_PATH],
+            env: {
+              COWORK_BACKEND_PORT: String(BACKEND_PORT),
+              COWORK_BACKEND_HOST: '127.0.0.1',
+              ...(sessionId ? { COWORK_SESSION_ID: sessionId } : {}),
+            },
+          },
+        },
+      };
+      claudeArgs.push('--mcp-config', JSON.stringify(mcpConfig));
+      claudeArgs.push('--permission-prompt-tool', APPROVAL_TOOL_NAME);
+    } else if (!fs.existsSync(APPROVAL_MCP_PATH)) {
+      process.stderr.write(
+        `[claude] WARNING: approval MCP shim missing at ${APPROVAL_MCP_PATH}; permission prompts will hang turns\n`,
+      );
+    }
   }
   if (model) claudeArgs.push('--model', model);
   if (resumeId) claudeArgs.push('--resume', resumeId);
 
   // Log what we're actually running so failures are diagnosable.
+  const mcpTag = mcpAllow.length ? ` mcp=[${mcpAllow.join(',')}]` : '';
   const toolPolicy = mode === 'chat'
-    ? `allowed=${CHAT_MODE_ALLOWED_TOOLS} disallowed=${CHAT_MODE_DISALLOWED_TOOLS}`
-    : `allowed-tools=${effAllowed} permission-mode=${effPerm}` +
-      (effDisallowed ? ` disallowed-tools=${effDisallowed}` : '');
+    ? `allowed=${withMcp(CHAT_MODE_ALLOWED_TOOLS)} disallowed=${CHAT_MODE_DISALLOWED_TOOLS}${mcpTag}`
+    : `allowed-tools=${withMcp(effAllowed)} permission-mode=${effPerm}` +
+      (effDisallowed ? ` disallowed-tools=${effDisallowed}` : '') + mcpTag;
   process.stderr.write(
     `[claude] spawn shell=${sm} bin=${bin} cwd=${cwd} mode=${mode} model=${model || '-'} ` +
     `resume=${resumeId || '-'} addDirs=${(addDirs || []).length} ${toolPolicy}\n`
@@ -676,9 +1080,15 @@ function startClaude({ prompt, cwd, resumeId, mode, model, addDirs, permissionMo
   // user-attached folders. wrapWithSandbox returns null on non-Linux (no
   // sandbox implementation → fall back to host spawn as before) and throws
   // SANDBOX_UNAVAILABLE on Linux without bwrap (caller surfaces as SSE error).
+  //
+  // extraReadOnlyDirs: bind-mount the directory containing approval-mcp.cjs
+  // so the CLI can spawn the shim from inside the sandbox. The shim itself
+  // POSTs to 127.0.0.1:<BACKEND_PORT>; loopback works because we deliberately
+  // don't unshare the network namespace.
   const wrapped = wrapWithSandbox(bin, claudeArgs, {
     cwd,
     addDirs: addDirs || [],
+    extraReadOnlyDirs: [APPROVAL_MCP_DIR],
   });
   if (wrapped) {
     process.stderr.write(`[claude] sandbox bwrap cwd=${cwd} addDirs=${(addDirs || []).length}\n`);
@@ -758,7 +1168,7 @@ function translateCliEvent(evt, session, send, emittedPaths) {
             send('file_event', {
               path: rel,
               kind: name === 'Write' ? 'added' : 'modified',
-              url: `/sessions/${session.id}/files/${encodeURI(rel)}`,
+              url: fileEventUrl(session, rel),
             });
             matched = true;
             break;
@@ -772,7 +1182,7 @@ function translateCliEvent(evt, session, send, emittedPaths) {
             send('file_event', {
               path: abs,
               kind: name === 'Write' ? 'added' : 'modified',
-              url: `/sessions/${session.id}/files/${encodeURI(abs)}`,
+              url: fileEventUrl(session, abs),
             });
           }
         }
@@ -844,6 +1254,7 @@ async function streamMessages(res, session, prompt, { model } = {}) {
       disallowedTools: session.disallowedTools || null,
       shellMode: session.shellMode || 'default',
       dockerImage: session.dockerImage || null,
+      sessionId: session.id,
     });
   } catch (err) {
     send('error', { message: `Failed to launch claude CLI: ${err.message}` });
@@ -916,7 +1327,7 @@ async function streamMessages(res, session, prompt, { model } = {}) {
         send('file_event', {
           path: p,
           kind: prior ? 'modified' : 'added',
-          url: `/sessions/${session.id}/files/${encodeURI(p)}`,
+          url: fileEventUrl(session, p),
         });
       }
     }
@@ -930,6 +1341,20 @@ async function streamMessages(res, session, prompt, { model } = {}) {
 }
 
 // ---------- upload / file serving ----------
+
+// Build the public URL we emit in `file_event` payloads. When the session was
+// created with a stable `clientRef` (the renderer's chat id), we route through
+// the chat-keyed endpoint — those URLs stay valid across app restarts because
+// they resolve against the deterministic `<sandboxRoot>/c-<clientRef>` cwd +
+// any live session's attached folders, rather than an in-memory session id
+// that evaporates on restart. Fallback to the session-keyed URL keeps older
+// or clientRef-less sessions working.
+function fileEventUrl(session, relOrAbs) {
+  if (session?.clientRef) {
+    return `/chats/${encodeURIComponent(session.clientRef)}/files/${encodeURI(relOrAbs)}`;
+  }
+  return `/sessions/${session.id}/files/${encodeURI(relOrAbs)}`;
+}
 
 async function handleUpload(req, res, session) {
   const rawName = req.headers['x-filename'];
@@ -969,16 +1394,12 @@ async function handleUpload(req, res, session) {
   });
 }
 
-function handleFileGet(req, res, session, relEncoded) {
-  let rel;
-  try { rel = decodeURIComponent(relEncoded); } catch { return end(res, 400); }
-
-  // A file may live under session.cwd OR any of the --add-dir extras the user
-  // attached — plus the path could be absolute or relative. Walk every
-  // allowed root and serve the first hit. Absolute paths that don't live
-  // under any root end up here too; safeRelInSandbox rejects them per-root
-  // so traversal (`../`) can't escape.
-  const roots = [session.cwd, ...(session.addDirs || [])];
+// Stream a file from the first root that claims it. Shared between
+// session-keyed (`/sessions/:id/files/...`) and chat-keyed
+// (`/chats/:clientRef/files/...`) routes. `emittedAbsPaths` is an optional
+// allow-list of absolute paths that may be served even when they live outside
+// every root — used when the CLI wrote to a folder the user later detached.
+function serveFileFromRoots(req, res, rel, roots, emittedAbsPaths) {
   const tried = [];
   for (const root of roots) {
     if (!root) continue;
@@ -999,12 +1420,7 @@ function handleFileGet(req, res, session, relEncoded) {
     return;
   }
 
-  // Also accept a bare absolute path as a last resort: if the CLI wrote to a
-  // folder that isn't currently attached (e.g. the user removed it), we still
-  // want a preview so the FilesPanel entry isn't a dead link. Only allow it
-  // if the absolute path was previously emitted during this session — that
-  // set lives on the session so we don't open the door to arbitrary reads.
-  if (path.isAbsolute(rel) && session.emittedAbsPaths?.has(path.resolve(rel))) {
+  if (path.isAbsolute(rel) && emittedAbsPaths?.has(path.resolve(rel))) {
     const full = path.resolve(rel);
     let st;
     try { st = fs.statSync(full); } catch {
@@ -1022,12 +1438,70 @@ function handleFileGet(req, res, session, relEncoded) {
     return;
   }
 
-  // Log the miss so we can tell from backend stderr whether the path is simply
-  // outside every root, or the file really doesn't exist on disk.
   process.stderr.write(
     `[files] 404 rel=${JSON.stringify(rel)} roots=${JSON.stringify(roots)} tried=${JSON.stringify(tried)}\n`,
   );
-  return end(res, 404);
+  // Include diagnostic JSON in the body so the FilesPanel can show the user
+  // *why* the preview failed (which roots the backend walked). HEAD requests
+  // still get an empty body.
+  if (req.method === 'HEAD') return end(res, 404);
+  res.writeHead(404, { 'Content-Type': 'application/json' });
+  res.end(JSON.stringify({ error: 'file not found', rel, roots, tried }));
+}
+
+function handleFileGet(req, res, session, relEncoded) {
+  let rel;
+  try { rel = decodeURIComponent(relEncoded); } catch { return end(res, 400); }
+
+  // A file may live under session.cwd OR any of the --add-dir extras the user
+  // attached — plus the path could be absolute or relative. Walk every
+  // allowed root and serve the first hit. Absolute paths that don't live
+  // under any root end up here too; safeRelInSandbox rejects them per-root
+  // so traversal (`../`) can't escape.
+  const roots = [session.cwd, ...(session.addDirs || [])];
+  return serveFileFromRoots(req, res, rel, roots, session.emittedAbsPaths);
+}
+
+// Serve by chat id (clientRef) rather than ephemeral session id. The
+// deterministic ephemeral cwd `<sandboxRoot>/c-<clientRef>` is always a
+// candidate root; if a live session with this clientRef exists we also walk
+// its cwd + addDirs + emittedAbsPaths, so files living under user-attached
+// folders still resolve. This URL shape survives app restarts — that's the
+// whole point.
+function handleChatFileGet(req, res, clientRef, relEncoded, { sandboxRoot }) {
+  let rel;
+  try { rel = decodeURIComponent(relEncoded); } catch { return end(res, 400); }
+
+  const safeRef = String(clientRef || '').replace(/[^A-Za-z0-9._-]/g, '').slice(0, 64);
+  if (!safeRef) return end(res, 404);
+
+  const roots = [path.join(sandboxRoot, `c-${safeRef}`)];
+  let emittedAbsPaths;
+  // First: any live session that matches this clientRef. Its cwd/addDirs are
+  // the current source of truth, plus it carries `emittedAbsPaths` for files
+  // that were written outside every attached root during the turn.
+  for (const s of sessions.values()) {
+    if (s.clientRef !== safeRef) continue;
+    if (s.cwd && !roots.includes(s.cwd)) roots.push(s.cwd);
+    for (const d of (s.addDirs || [])) {
+      if (d && !roots.includes(d)) roots.push(d);
+    }
+    if (s.emittedAbsPaths) emittedAbsPaths = s.emittedAbsPaths;
+  }
+  // Second: the chat's registered roots (set when the renderer activates a
+  // chat). Covers the common case where the user opens a historical chat,
+  // scrolls through past previews, but hasn't sent a new message yet — no
+  // session has spun up for this chat, so the `sessions` loop above produced
+  // nothing.
+  const reg = chatRoots.get(safeRef);
+  if (reg) {
+    if (reg.cwd && !roots.includes(reg.cwd)) roots.push(reg.cwd);
+    for (const d of (reg.addDirs || [])) {
+      if (d && !roots.includes(d)) roots.push(d);
+    }
+  }
+
+  return serveFileFromRoots(req, res, rel, roots, emittedAbsPaths);
 }
 
 // ---------- router ----------
@@ -1051,6 +1525,81 @@ async function route(req, res, { sandboxRoot }) {
     return json(res, 200, await getClaudeInfo());
   }
 
+  // ---------- approval gate ----------
+  //
+  // Three endpoints, three audiences:
+  //
+  //   POST /approval/request   — called by the stdio MCP shim that the Claude
+  //                              CLI spawns when a permission gate fires.
+  //                              Long-polls until the user answers or the
+  //                              broker's auto-deny timeout kicks in. Response
+  //                              body is `{ behavior: 'allow'|'deny', ... }`.
+  //
+  //   GET  /approval/events    — SSE stream the renderer subscribes to. Emits
+  //                              `snapshot` once on connect, then a stream of
+  //                              `approval_pending` and `approval_resolved`
+  //                              events. Drives the in-app modal.
+  //
+  //   POST /approval/answer    — renderer posts the user's decision here.
+  //
+  // The whole flow is documented in electron/approval.cjs.
+
+  if (req.method === 'POST' && p === '/approval/request') {
+    const body = await readJson(req).catch(() => ({}));
+    const decision = await approval.requestApproval({
+      toolName: typeof body.toolName === 'string' ? body.toolName : 'unknown',
+      toolUseId: typeof body.toolUseId === 'string' ? body.toolUseId : null,
+      input: (body.input && typeof body.input === 'object') ? body.input : {},
+      sessionId: typeof body.sessionId === 'string' ? body.sessionId : null,
+    });
+    return json(res, 200, decision);
+  }
+
+  if (req.method === 'POST' && p === '/approval/answer') {
+    const body = await readJson(req).catch(() => ({}));
+    const id = typeof body.id === 'string' ? body.id : null;
+    if (!id) return json(res, 400, { error: 'id required' });
+    const ok = approval.submitDecision(id, {
+      behavior: body.behavior,
+      message: typeof body.message === 'string' ? body.message : undefined,
+      updatedInput: body.updatedInput && typeof body.updatedInput === 'object'
+        ? body.updatedInput
+        : undefined,
+    });
+    return json(res, ok ? 200 : 404, { ok, id });
+  }
+
+  if (req.method === 'GET' && p === '/approval/pending') {
+    return json(res, 200, { pending: approval.listPending() });
+  }
+
+  if (req.method === 'GET' && p === '/approval/events') {
+    res.writeHead(200, {
+      'Content-Type': 'text/event-stream',
+      'Cache-Control': 'no-cache, no-transform',
+      Connection: 'keep-alive',
+      'X-Accel-Buffering': 'no',
+    });
+    try { res.flushHeaders?.(); } catch {}
+    try { res.socket?.setNoDelay(true); } catch {}
+    try { res.socket?.setKeepAlive(true); } catch {}
+    const send = (event, data) => {
+      try { res.write(`event: ${event}\ndata: ${JSON.stringify(data)}\n\n`); }
+      catch { /* client gone */ }
+    };
+    const unsubscribe = approval.subscribeEvents(send);
+    // Heartbeat so proxies / OSes don't reap the idle socket between events.
+    const heartbeat = setInterval(() => {
+      try { res.write(`: ping\n\n`); } catch {}
+    }, 25000);
+    req.on('close', () => {
+      clearInterval(heartbeat);
+      unsubscribe();
+      try { res.end(); } catch {}
+    });
+    return; // don't fall through; the connection stays open
+  }
+
   // Account info — `claude auth status` (JSON). Exit 0 = signed in.
   if (req.method === 'GET' && p === '/auth-status') {
     return json(res, 200, await getAuthStatus());
@@ -1067,6 +1616,104 @@ async function route(req, res, { sandboxRoot }) {
   // without bwrap it shows install hints for the current distro family.
   if (req.method === 'GET' && p === '/sandbox-status') {
     return json(res, 200, detectSandbox());
+  }
+
+  // MCP registry listing — powers the Settings → MCP Servers tab. Fetched
+  // server-side to avoid CORS and cached in-memory for 5 minutes. Pass
+  // `?refresh=1` to bypass the cache.
+  if (req.method === 'GET' && p === '/mcp-registry/servers') {
+    try {
+      const force = url.searchParams.get('refresh') === '1';
+      const out = await getMcpRegistryServers({ force });
+      return json(res, 200, out);
+    } catch (e) {
+      return json(res, 502, { error: String(e?.message || e) });
+    }
+  }
+
+  // Cowork's curated subset of the MCP ecosystem — the list of servers we
+  // know how to install end-to-end (auth flow + config write-through).
+  if (req.method === 'GET' && p === '/mcp-curated/servers') {
+    try { return json(res, 200, readCuratedCatalog()); }
+    catch (e) { return json(res, 500, { error: String(e?.message || e) }); }
+  }
+
+  // MCP servers currently configured in ~/.claude.json (i.e. what the CLI
+  // will connect to on its next spawn). Annotated with curated metadata
+  // when we recognise the id.
+  if (req.method === 'GET' && p === '/mcp-installed') {
+    try { return json(res, 200, { servers: listInstalledMcpServers() }); }
+    catch (e) { return json(res, 500, { error: String(e?.message || e) }); }
+  }
+
+  // Install a curated server. Body: { id, params?, env? } — `params` values
+  // get substituted into `{placeholder}` args; `env` values are written to
+  // the spec's `env` block and passed to the MCP subprocess by the CLI.
+  if (req.method === 'POST' && p === '/mcp-curated/install') {
+    try {
+      const body = await readJson(req);
+      if (!body?.id) return json(res, 400, { error: 'id required' });
+      const out = installCuratedMcpServer(body.id, body.params, body.env);
+      return json(res, 200, { ok: true, ...out });
+    } catch (e) {
+      return json(res, 400, { error: String(e?.message || e) });
+    }
+  }
+
+  // Remove a server from ~/.claude.json. No confirmation — the UI handles
+  // that before calling.
+  {
+    const m = p.match(/^\/mcp-installed\/([^/]+)$/);
+    if (m && req.method === 'DELETE') {
+      try { return json(res, 200, uninstallMcpServer(decodeURIComponent(m[1]))); }
+      catch (e) { return json(res, 500, { error: String(e?.message || e) }); }
+    }
+  }
+
+  // ----- Plugins -----
+  // Plugins are host-side helper processes (see electron/plugins.cjs). The UI
+  // in Settings → Plugins uses these routes to list, configure, and
+  // start/stop them. Settings persist in ~/.cowork/plugins.json.
+
+  if (req.method === 'GET' && p === '/plugins/catalog') {
+    try { return json(res, 200, plugins.readCatalog()); }
+    catch (e) { return json(res, 500, { error: String(e?.message || e) }); }
+  }
+
+  if (req.method === 'GET' && p === '/plugins') {
+    try { return json(res, 200, { plugins: plugins.listPlugins() }); }
+    catch (e) { return json(res, 500, { error: String(e?.message || e) }); }
+  }
+
+  {
+    const m = p.match(/^\/plugins\/([^/]+)\/settings$/);
+    if (m && req.method === 'POST') {
+      try {
+        const body = await readJson(req);
+        const merged = plugins.setSettings(decodeURIComponent(m[1]), body?.settings || {});
+        return json(res, 200, { settings: merged });
+      } catch (e) { return json(res, 400, { error: String(e?.message || e) }); }
+    }
+  }
+
+  {
+    const m = p.match(/^\/plugins\/([^/]+)\/start$/);
+    if (m && req.method === 'POST') {
+      try {
+        const status = await plugins.startPlugin(decodeURIComponent(m[1]));
+        return json(res, 200, status);
+      } catch (e) { return json(res, 500, { error: String(e?.message || e) }); }
+    }
+  }
+
+  {
+    const m = p.match(/^\/plugins\/([^/]+)\/stop$/);
+    if (m && req.method === 'POST') {
+      try {
+        const status = await plugins.stopPlugin(decodeURIComponent(m[1]));
+        return json(res, 200, status);
+      } catch (e) { return json(res, 500, { error: String(e?.message || e) }); }
+    }
   }
 
   // Usage blobs — runs `claude -p "/<name>"` and returns whatever it prints.
@@ -1206,6 +1853,7 @@ async function route(req, res, { sandboxRoot }) {
 
     const s = {
       id, cwd, mode, managed, model, addDirs,
+      clientRef,
       permissionMode, allowedTools, disallowedTools,
       shellMode, dockerImage,
       createdAt: Date.now(),
@@ -1235,6 +1883,10 @@ async function route(req, res, { sandboxRoot }) {
     if (req.method === 'DELETE') {
       if (!s) return end(res, 204);
       sessions.delete(s.id);
+      // Cancel any approval prompts still waiting on this session — the CLI
+      // child is about to die; without this the broker would hold its modal
+      // open forever (or until the auto-deny timer).
+      approval.cancelForSession(s.id);
       // Only delete the directory if we created it. User-picked folders are
       // left entirely alone — the session just forgets about them.
       if (s.managed) {
@@ -1261,6 +1913,66 @@ async function route(req, res, { sandboxRoot }) {
     return handleFileGet(req, res, s, m[2]);
   }
 
+  // Chat-keyed file route. Survives app restarts because the resolution is
+  // driven by `<sandboxRoot>/c-<clientRef>` (deterministic per chat) plus any
+  // live session's attached folders. Prefer this route when emitting URLs so
+  // old messages' file links keep working.
+  if ((m = p.match(/^\/chats\/([^/]+)\/files\/(.+)$/))) {
+    if (req.method !== 'GET' && req.method !== 'HEAD') return end(res, 405);
+    return handleChatFileGet(req, res, decodeURIComponent(m[1]), m[2], { sandboxRoot });
+  }
+
+  // Diagnostic dump for a chat: which roots are registered, which live
+  // sessions are keyed to this clientRef, whether the ephemeral cwd exists
+  // on disk. Purely read-only; handy for debugging file-preview 404s.
+  if ((m = p.match(/^\/chats\/([^/]+)\/debug$/))) {
+    if (req.method !== 'GET') return end(res, 405);
+    const safeRef = decodeURIComponent(m[1]).replace(/[^A-Za-z0-9._-]/g, '').slice(0, 64);
+    if (!safeRef) return json(res, 400, { error: 'invalid clientRef' });
+    const ephemeral = path.join(sandboxRoot, `c-${safeRef}`);
+    let ephemeralExists = false;
+    try { ephemeralExists = fs.statSync(ephemeral).isDirectory(); } catch {}
+    const matchingSessions = [];
+    for (const s of sessions.values()) {
+      if (s.clientRef !== safeRef) continue;
+      matchingSessions.push({ id: s.id, cwd: s.cwd, addDirs: s.addDirs || [] });
+    }
+    return json(res, 200, {
+      clientRef: safeRef,
+      ephemeralCwd: ephemeral,
+      ephemeralExists,
+      registeredRoots: chatRoots.get(safeRef) || null,
+      matchingSessions,
+    });
+  }
+
+  // Register (or clear) the chat's roots so the chat-keyed file route can
+  // serve files without first spinning up a live CLI session. Renderer calls
+  // this when a chat becomes active. Body: { cwd?: string, addDirs?: string[] }.
+  // POST with nothing (or `{}`) clears the registration.
+  if ((m = p.match(/^\/chats\/([^/]+)\/roots$/))) {
+    if (req.method !== 'POST') return end(res, 405);
+    const safeRef = decodeURIComponent(m[1]).replace(/[^A-Za-z0-9._-]/g, '').slice(0, 64);
+    if (!safeRef) return json(res, 400, { error: 'invalid clientRef' });
+    const body = await readJson(req).catch(() => ({}));
+    const cwd = typeof body.cwd === 'string' && path.isAbsolute(body.cwd) ? path.resolve(body.cwd) : null;
+    const addDirs = Array.isArray(body.addDirs)
+      ? body.addDirs
+          .filter((d) => typeof d === 'string' && path.isAbsolute(d))
+          .map((d) => path.resolve(d))
+      : [];
+    if (!cwd && addDirs.length === 0) {
+      chatRoots.delete(safeRef);
+      process.stderr.write(`[chats] roots cleared clientRef=${safeRef}\n`);
+    } else {
+      chatRoots.set(safeRef, { cwd, addDirs });
+      process.stderr.write(
+        `[chats] roots set clientRef=${safeRef} cwd=${JSON.stringify(cwd)} addDirs=${JSON.stringify(addDirs)}\n`,
+      );
+    }
+    return json(res, 200, { ok: true, cwd, addDirs });
+  }
+
   if ((m = p.match(/^\/sessions\/([^/]+)\/messages$/))) {
     if (req.method !== 'POST') return end(res, 405);
     const s = sessions.get(m[1]);
@@ -1279,11 +1991,19 @@ async function route(req, res, { sandboxRoot }) {
 
 // ---------- public API ----------
 
-async function startBackend({ sandboxRoot } = {}) {
+async function startBackend({ sandboxRoot, onApprovalPending } = {}) {
   if (!sandboxRoot) throw new Error('sandboxRoot required');
   fs.mkdirSync(sandboxRoot, { recursive: true });
 
   const port = await pickFreePort();
+  // Stash the port for startClaude → MCP shim env. Has to happen before we
+  // start serving, since the very first chat turn could try to spawn a CLI.
+  BACKEND_PORT = port;
+  // Wire the DE-notification hook (set by main.cjs). The broker will fire
+  // this every time a new approval lands, in addition to broadcasting on the
+  // SSE channel for in-app modals.
+  approval.init({ onPending: onApprovalPending });
+
   const server = http.createServer((req, res) => {
     route(req, res, { sandboxRoot }).catch((err) => {
       process.stderr.write(`[backend] ${err?.stack || err}\n`);
@@ -1302,6 +2022,12 @@ async function startBackend({ sandboxRoot } = {}) {
   const url = `http://127.0.0.1:${port}`;
 
   async function stop() {
+    // Kill any plugin child processes we started (e.g. Chrome launched by the
+    // chrome-controller plugin) before we tear down the HTTP server. Best
+    // effort — on a successful `app.quit` the children would die with us
+    // anyway since we spawn with `detached: false`, but an explicit SIGTERM
+    // gives Chrome a chance to flush profile state gracefully.
+    await plugins.shutdownAll().catch(() => {});
     await new Promise((resolve) => server.close(() => resolve()));
     // Best-effort: clear in-memory session registry. Sandboxes on disk stay
     // put — they live under userData so uninstall doesn't clobber them.

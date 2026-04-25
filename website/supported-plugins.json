@@ -1,0 +1,49 @@
+{
+  "version": 1,
+  "updatedAt": "2026-04-25",
+  "description": "Curated list of Cowork plugins. A plugin is a host-side helper process the Electron main spawns OUTSIDE the bubblewrap sandbox. Plugins manage host resources (e.g. a real browser) and expose local endpoints so sandboxed `claude` turns (and any MCP server) can reach them without needing the sandbox to be widened. Settings declared here are rendered dynamically by the Plugins tab in Settings; runtime values are persisted under ~/.cowork/plugins.json (mode 0600).",
+  "plugins": [
+    {
+      "id": "chrome-controller",
+      "name": "Chrome Controller",
+      "description": "Launches a managed Chrome instance on the host with the Chrome DevTools Protocol (CDP) enabled. Chrome cannot be launched from inside a chat turn because the sandbox hides X11, Wayland, and dbus; this plugin runs on the host instead and exposes a CDP endpoint on loopback (http://127.0.0.1:<port>). Point an MCP server like chrome-devtools-mcp at that URL via --browserUrl and it can drive real pages with real logins.",
+      "iconUrl": "https://github.com/GoogleChrome.png?size=64",
+      "categories": ["browser"],
+      "settings": [
+        {
+          "key": "chromePath",
+          "label": "Chrome binary",
+          "description": "Absolute path to the Chrome executable, or the command name if it is on $PATH. Leave blank to auto-detect (google-chrome, google-chrome-stable, chromium, chromium-browser, chrome).",
+          "type": "text",
+          "default": "",
+          "placeholder": "auto-detect"
+        },
+        {
+          "key": "port",
+          "label": "CDP port",
+          "description": "Port Chrome listens on for --remote-debugging-port. Bound to 127.0.0.1 only. If a Chrome is already answering CDP on this port, the plugin adopts it instead of starting a duplicate.",
+          "type": "number",
+          "default": 9222,
+          "min": 1024,
+          "max": 65535
+        },
+        {
+          "key": "headless",
+          "label": "Run headless",
+          "description": "Launch Chrome without a visible window (--headless=new). Handy on servers, in VMs, or when the browser is purely for automation.",
+          "type": "boolean",
+          "default": false
+        },
+        {
+          "key": "userDataDir",
+          "label": "User data directory",
+          "description": "Path to the Chrome profile this plugin uses. Leave blank for a dedicated Cowork profile at ~/.cache/cowork/chrome-<port>. A dedicated profile is recommended — without one, Chrome's singleton lock silently hands our launch off to your daily Chrome and --remote-debugging-port gets ignored. Only override if you deliberately want to share a profile, in which case close any other Chrome using that profile first.",
+          "type": "text",
+          "default": "",
+          "placeholder": "~/.cache/cowork/chrome-9222 (auto)"
+        }
+      ],
+      "notes": "Runs on the host, not inside the sandbox. The CDP endpoint is bound to loopback only, so only local processes can drive the browser. By default the plugin uses a fresh profile under ~/.cache/cowork — no shared logins, no conflict with your daily Chrome. If you point it at a profile your daily Chrome uses, assume any session that browser is logged into (email, banking, work SSO) is reachable by whatever attaches to CDP."
+    }
+  ]
+}
